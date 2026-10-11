@@ -1,0 +1,295 @@
+from __future__ import annotations
+
+import asyncio
+from asyncio.staggered import staggered_race
+from dataclasses import dataclass, field
+from pathlib import Path
+from collections.abc import Callable
+from typing import Any
+
+from loguru import logger
+
+from app.client import buildClient, fetchFile
+from app.models.task import TaskError
+
+
+@dataclass(frozen=True)
+class Repo:
+    name: str
+    mirrors: dict[str, str] = field(default_factory=dict)
+
+    def nameOn(self, source: str) -> str | None:
+        if source == "github":
+            return self.name
+        return self.mirrors.get(source)
+
+    def buildSources(self) -> list[str]:
+        return [s for s in SOURCE_ORDER if self.nameOn(s) is not None]
+
+
+@dataclass(frozen=True)
+class SourceEndpoints:
+    api: str
+    download: str
+    raw: str
+    rawInfix: str
+
+
+SOURCES = {
+    "gitcode": SourceEndpoints(
+        api="https://api.gitcode.com/api/v5/repos",
+        download="https://gitcode.com",
+        raw="https://cnb.cool",
+        rawInfix="/-/git/raw/",
+    ),
+    "github": SourceEndpoints(
+        api="https://api.github.com/repos",
+        download="https://github.com",
+        raw="https://raw.githubusercontent.com",
+        rawInfix="/",
+    ),
+}
+
+SOURCE_ORDER = ("github", "gitcode")
+STAGGER_DELAY = 0.05
+
+
+@dataclass(frozen=True)
+class ReleaseAsset:
+    name: str
+    size: int
+    downloadCount: int
+    downloadUrl: str
+
+
+@dataclass(frozen=True)
+class Release:
+    version: str
+    publishedAt: str
+    body: str
+    pageUrl: str
+    prerelease: bool
+    assets: list[ReleaseAsset]
+
+    @classmethod
+    def fromResponse(cls, data: dict[str, Any]) -> Release:
+        version = ""
+        for key in ("tag_name", "name"):
+            value = str(data.get(key) or "").strip()
+            if value:
+                version = value
+                break
+
+        assets = [
+            ReleaseAsset(
+                name=a.get("name", ""),
+                size=a.get("size", 0),
+                downloadCount=a.get("download_count", 0),
+                downloadUrl=a.get("browser_download_url", ""),
+            )
+            for a in data.get("assets", [])
+        ]
+
+        return cls(
+            version=version or "Unknown",
+            publishedAt=data.get("published_at", "") or data.get("created_at", ""),
+            body=data.get("body", "") or "",
+            pageUrl=data.get("html_url", ""),
+            prerelease=data.get("prerelease", False),
+            assets=assets,
+        )
+
+
+async def fetchLatestRelease(repo: Repo) -> Release:
+    from app.update import parseVersion
+
+    async def attempt(source):
+        endpoints = SOURCES[source]
+        url = f"{endpoints.api}/{repo.nameOn(source)}/releases/latest"
+        headers = {"accept": "application/vnd.github+json"} if source == "github" else {}
+        client = buildClient(headers=headers, timeout=15)
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = await resp.json()
+            return Release.fromResponse(data)
+        except Exception as e:
+            logger.debug("从 {} 获取 {} release 失败: {}", source, repo.name, repr(e))
+            raise
+        finally:
+            client.close()
+
+    sources = repo.buildSources()
+    results = await asyncio.gather(
+        *[attempt(s) for s in sources], return_exceptions=True)
+    chosen: Release | None = None
+    for result in results:
+        if isinstance(result, BaseException):
+            continue
+        if chosen is None:
+            chosen = result
+            continue
+        if parseVersion(result.version) > parseVersion(chosen.version):
+            chosen = result
+    if chosen is None:
+        raise TaskError("无法获取 {name} 的最新 release", name=repo.name)
+    return chosen
+
+
+
+async def fetchJson(repo: Repo, branch: str, path: str) -> tuple[dict, str]:
+    async def attempt(source):
+        endpoints = SOURCES[source]
+        url = f"{endpoints.raw}/{repo.nameOn(source)}{endpoints.rawInfix}{branch}/{path}"
+        client = buildClient(timeout=15)
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            result = await resp.json()
+            return result, source
+        except Exception as e:
+            logger.debug("从 {} 获取 {}/{} 失败: {}", source, repo.name, path, repr(e))
+            raise
+        finally:
+            client.close()
+
+    result, index, _ = await staggered_race(
+        [lambda s=s: attempt(s) for s in repo.buildSources()], STAGGER_DELAY)
+    if index is not None:
+        return result
+    raise TaskError("无法获取 {name}/{branch}/{path}", name=repo.name, branch=branch, path=path)
+
+
+async def fetchRawFile(
+    repo: Repo, branch: str, path: str, outputPath: Path,
+    onProgress: Callable[[float], None] | None = None,
+) -> str:
+    async def probe(source):
+        endpoints = SOURCES[source]
+        url = f"{endpoints.raw}/{repo.nameOn(source)}{endpoints.rawInfix}{branch}/{path}"
+        client = buildClient(headers={"Range": "bytes=0-0"}, timeout=10)
+        try:
+            resp = await client.get(url)
+            try:
+                resp.raise_for_status()
+                return url, source
+            finally:
+                resp.close()
+        except Exception as e:
+            logger.debug("从 {} 下载 {}/{} 失败: {}", source, repo.name, path, repr(e))
+            raise
+        finally:
+            client.close()
+
+    result, index, _ = await staggered_race(
+        [lambda s=s: probe(s) for s in repo.buildSources()], STAGGER_DELAY)
+    if index is None:
+        raise TaskError("无法下载 {name}/{branch}/{path}", name=repo.name, branch=branch, path=path)
+    url, source = result
+    await fetchFile(url, outputPath, onProgress=onProgress)
+    return source
+
+
+async def probeDownloadUrl(repo: Repo, tag: str, asset: str) -> str:
+    async def probe(source):
+        url = buildDownloadUrl(repo, tag, asset, source=source)
+        client = buildClient(headers={"Range": "bytes=0-0"}, timeout=10)
+        try:
+            resp = await client.get(url)
+            try:
+                resp.raise_for_status()
+                return url
+            finally:
+                resp.close()
+        except Exception as e:
+            logger.debug("从 {} 下载 {}/{} 失败: {}", source, repo.name, asset, repr(e))
+            raise
+        finally:
+            client.close()
+
+    result, index, _ = await staggered_race(
+        [lambda s=s: probe(s) for s in repo.buildSources()], STAGGER_DELAY)
+    if index is None:
+        raise TaskError("无法下载 {name}/{tag}/{asset}", name=repo.name, tag=tag, asset=asset)
+    return result
+
+
+async def fetchReleaseAsset(
+    repo: Repo, tag: str, asset: str, outputPath: Path,
+    onProgress: Callable[[float], None] | None = None,
+) -> str:
+    url = await probeDownloadUrl(repo, tag, asset)
+    await fetchFile(url, outputPath, onProgress=onProgress)
+    return url
+
+
+PYPI_MIRRORS = {
+    "gitcode": "https://mirrors.bfsu.edu.cn/pypi/web/json",
+    "github": "https://pypi.org/pypi",
+}
+PYPI_FILES = "https://files.pythonhosted.org/packages/"
+PYPI_FILES_MIRROR = "https://mirrors.bfsu.edu.cn/pypi/web/packages/"
+
+
+def buildPypiUrl(package: str, *, source: str) -> str:
+    base = PYPI_MIRRORS.get(source, PYPI_MIRRORS["github"])
+    if source == "gitcode":
+        return f"{base}/{package}"
+    return f"{base}/{package}/json"
+
+
+async def fetchPypiReleases(package: str) -> dict[str, list[dict]]:
+    async def attempt(source):
+        url = buildPypiUrl(package, source=source)
+        client = buildClient(timeout=15)
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return (await resp.json())["releases"]
+        except Exception as e:
+            logger.debug("从 {} 获取 PyPI {} 失败: {}", source, package, repr(e))
+            raise
+        finally:
+            client.close()
+
+    results = await asyncio.gather(*[attempt(s) for s in SOURCE_ORDER], return_exceptions=True)
+    succeeded = [r for r in results if not isinstance(r, BaseException)]
+    if not succeeded:
+        raise TaskError("无法获取 PyPI 包信息: {package}", package=package)
+    releases: dict[str, list[dict]] = {}
+    for result in reversed(succeeded):
+        releases |= result
+    return releases
+
+
+async def fetchPypiFile(url: str, outputPath: Path, onProgress: Callable[[float], None] | None = None) -> None:
+    async def probe(candidate):
+        client = buildClient(headers={"Range": "bytes=0-0"}, timeout=10)
+        try:
+            resp = await client.get(candidate)
+            try:
+                resp.raise_for_status()
+                return candidate
+            finally:
+                resp.close()
+        except Exception as e:
+            logger.debug("下载 {} 失败: {}", candidate, repr(e))
+            raise
+        finally:
+            client.close()
+
+    candidates = [url, url.replace(PYPI_FILES, PYPI_FILES_MIRROR, 1)] if url.startswith(PYPI_FILES) else [url]
+    result, index, _ = await staggered_race([lambda c=c: probe(c) for c in candidates], STAGGER_DELAY)
+    if index is None:
+        raise TaskError("无法下载 {url}", url=url)
+    await fetchFile(result, outputPath, onProgress=onProgress)
+
+
+def buildDownloadUrl(repo: Repo, tag: str, asset: str, *, source: str) -> str:
+    endpoints = SOURCES[source]
+    return f"{endpoints.download}/{repo.nameOn(source)}/releases/download/{tag}/{asset}"
+
+
+def buildRawUrl(repo: Repo, branch: str, path: str, *, source: str) -> str:
+    endpoints = SOURCES[source]
+    return f"{endpoints.raw}/{repo.nameOn(source)}{endpoints.rawInfix}{branch}/{path}"

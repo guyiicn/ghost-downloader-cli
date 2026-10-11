@@ -1,0 +1,428 @@
+from __future__ import annotations
+
+import asyncio
+import time
+import urllib.parse
+from functools import reduce
+from hashlib import md5
+from urllib.parse import parse_qsl, urlparse
+
+from app.client import buildClient
+from app.signal import Signal
+from .config import bilibiliConfig
+
+MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+    33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
+    61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
+    36, 20, 34, 44, 52,
+]
+
+QR_GENERATE_API = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+QR_POLL_API = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+LOGIN_INFO_API = "https://api.bilibili.com/x/web-interface/nav"
+LOGOUT_API = "https://passport.bilibili.com/login/exit/v2"
+QR_POLL_INTERVAL = 2.0
+QR_UNSCANNED = 86101
+QR_SCANNED = 86090
+QR_EXPIRED = 86038
+QR_GOT_URL = 0
+QR_LOGIN_SUCCESS = 1
+QR_LOGIN_FAILED = -1
+
+ZONE_API = "https://api.bilibili.com/x/web-interface/zone"
+COUNTRY_LIST_API = "https://passport.bilibili.com/web/generic/country/list"
+CAPTCHA_API = "https://passport.bilibili.com/x/passport-login/captcha"
+SMS_SEND_API = "https://passport.bilibili.com/x/passport-login/web/sms/send"
+SMS_LOGIN_API = "https://passport.bilibili.com/x/passport-login/web/login/sms"
+SMS_SOURCE = "main-fe-header"
+DEFAULT_ZONE = 86
+
+COOKIE_ORDER = ("SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5", "sid")
+
+PASSPORT_HEADERS = {
+    "referer": "https://www.bilibili.com/",
+    "origin": "https://www.bilibili.com",
+}
+
+
+def cookiesFrom(response) -> dict[str, str]:
+    return {c.name: c.value for c in response.cookies
+            if c.name in COOKIE_ORDER and c.value}
+
+
+def toCookie(raw: str) -> str:
+    parts: dict[str, str] = {}
+    for part in raw.replace("\r", ";").replace("\n", ";").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name, value = name.strip(), value.strip()
+        if name and value:
+            parts[name] = value
+    if not parts:
+        return ""
+    ordered = [n for n in COOKIE_ORDER if n in parts]
+    extra = [n for n in parts if n not in COOKIE_ORDER]
+    return "; ".join(f"{n}={parts[n]}" for n in ordered + extra)
+
+
+class BilibiliAccount:
+    accountChanged = Signal()
+    qrStateChanged = Signal(int, str)
+
+    def __init__(self, coroutineRunner):
+        self._coroutineRunner = coroutineRunner
+        self._username = ""
+        self._mid = ""
+        self._vip = ""
+        self._mixinKey = ""
+        self._qrWorkId = ""
+        self._captchaToken = ""
+        self._smsCaptchaKey = ""
+
+    @property
+    def cookie(self) -> str:
+        return bilibiliConfig.userCookie.value
+
+    @property
+    def isLoggedIn(self) -> bool:
+        return bool(self.cookie)
+
+    @property
+    def username(self) -> str:
+        return self._username
+
+    @property
+    def mid(self) -> str:
+        return self._mid
+
+    @property
+    def vip(self) -> str:
+        return self._vip
+
+    def _updateWbiKeys(self, data: dict) -> None:
+        wbiImg = data.get("wbi_img") or {}
+        imgUrl = str(wbiImg.get("img_url") or "")
+        subUrl = str(wbiImg.get("sub_url") or "")
+        imgKey = imgUrl.rsplit("/", 1)[-1].split(".")[0] if imgUrl else ""
+        subKey = subUrl.rsplit("/", 1)[-1].split(".")[0] if subUrl else ""
+        if imgKey and subKey:
+            orig = imgKey + subKey
+            self._mixinKey = reduce(lambda s, i: s + orig[i], MIXIN_KEY_ENC_TAB, "")[:32]
+
+    def signParams(self, params: dict) -> dict:
+        if not self._mixinKey:
+            return params
+        params["wts"] = round(time.time())
+        params = dict(sorted(params.items()))
+        params = {k: "".join(c for c in str(v) if c not in "!'()*") for k, v in params.items()}
+        query = urllib.parse.urlencode(params)
+        params["w_rid"] = md5((query + self._mixinKey).encode()).hexdigest()
+        return params
+
+    # ── QR login (wreq via coroutineRunner) ──
+
+    def startQrLogin(self):
+
+        self.cancelQrLogin()
+        self._qrWorkId = self._coroutineRunner.submit(
+            self._pollQrLogin(), done=self._onQrLoginDone, failed=self._onQrLoginFailed,
+        )
+
+    def cancelQrLogin(self):
+        if self._qrWorkId:
+    
+            self._coroutineRunner.cancel(self._qrWorkId)
+            self._qrWorkId = ""
+
+    async def _pollQrLogin(self) -> str | None:
+        client = buildClient()
+        try:
+            response = await client.get(QR_GENERATE_API)
+            response.raise_for_status()
+            payload = await response.json()
+            if payload.get("code") not in {None, 0}:
+                raise ValueError(payload.get("message") or "获取二维码失败")
+
+            data = payload.get("data") or {}
+            loginUrl = str(data.get("url") or "").strip()
+            qrCodeKey = str(data.get("qrcode_key") or "").strip()
+            if not loginUrl or not qrCodeKey:
+                raise ValueError("二维码接口返回了不完整的数据")
+
+            self._coroutineRunner.post(self.qrStateChanged.emit, QR_GOT_URL, loginUrl)
+
+            while True:
+                await asyncio.sleep(QR_POLL_INTERVAL)
+
+                response = await client.get(QR_POLL_API, query={"qrcode_key": qrCodeKey})
+                response.raise_for_status()
+                payload = await response.json()
+                data = payload.get("data") or {}
+                statusCode = int(data.get("code", -1))
+                statusMessage = str(data.get("message") or "")
+
+                if statusCode in {QR_UNSCANNED, QR_SCANNED}:
+                    self._coroutineRunner.post(self.qrStateChanged.emit, statusCode, statusMessage)
+                    continue
+
+                if statusCode == QR_EXPIRED:
+                    self._coroutineRunner.post(self.qrStateChanged.emit, QR_EXPIRED, "")
+                    return None
+
+                if statusCode == 0:
+                    items = cookiesFrom(response)
+                    if not any(n in items for n in COOKIE_ORDER):
+                        successUrl = str(data.get("url") or "")
+                        for name, value in parse_qsl(urlparse(successUrl).query, keep_blank_values=False):
+                            if name in COOKIE_ORDER and value:
+                                items[name] = value
+                    if items:
+                        return toCookie("; ".join(f"{k}={v}" for k, v in items.items()))
+
+                return ""
+        finally:
+            client.close()
+
+    def _onQrLoginDone(self, cookie: str | None):
+        self._qrWorkId = ""
+        if cookie is None:
+            return
+        if cookie:
+            self.setCookie(cookie)
+            self.qrStateChanged.emit(QR_LOGIN_SUCCESS, "")
+        else:
+            self.qrStateChanged.emit(QR_LOGIN_FAILED, "登录成功，但未能提取到有效 Cookie")
+
+    def _onQrLoginFailed(self, error):
+        self._qrWorkId = ""
+        self.qrStateChanged.emit(QR_LOGIN_FAILED, str(error))
+
+    # ── cookie / logout / account info (wreq via coroutineRunner) ──
+
+    def setCookie(self, cookie: str):
+        from app.config.cfg import cfg
+
+
+        cookie = toCookie(cookie)
+        oldCookie = self.cookie
+        if oldCookie and oldCookie != cookie:
+            def onDone(_):
+                cfg.set(bilibiliConfig.userCookie, cookie)
+                self.accountChanged.emit()
+                if cookie:
+                    self.fetchAccountInfo()
+            self._coroutineRunner.submit(self._logout(), done=onDone, failed=onDone)
+        else:
+            cfg.set(bilibiliConfig.userCookie, cookie)
+            self.accountChanged.emit()
+            if cookie:
+                self.fetchAccountInfo()
+
+    def logout(self):
+
+        self._coroutineRunner.submit(self._logout(), done=self._onLogoutDone, failed=self._onLogoutFailed)
+
+    def fetchAccountInfo(self):
+
+        self._coroutineRunner.submit(self._fetchAccountInfo(), done=self._onAccountInfoDone)
+
+    async def fetchWbiKeys(self) -> None:
+        if self._mixinKey:
+            return
+        client = buildClient()
+        try:
+            response = await client.get(LOGIN_INFO_API)
+            response.raise_for_status()
+            payload = await response.json()
+            self._updateWbiKeys(payload.get("data") or {})
+        finally:
+            client.close()
+
+    async def _logout(self) -> bool:
+        cookie = self.cookie
+        parts: dict[str, str] = {}
+        for part in cookie.split(";"):
+            part = part.strip()
+            if "=" in part:
+                name, value = part.split("=", 1)
+                parts[name.strip()] = value.strip()
+
+        required = ("DedeUserID", "bili_jct", "SESSDATA")
+        if any(not parts.get(n) for n in required):
+            return True
+
+        client = buildClient(headers={"cookie": cookie, **PASSPORT_HEADERS})
+        try:
+            response = await client.post(LOGOUT_API, form={
+                "biliCSRF": parts["bili_jct"],
+                "gourl": "https://www.bilibili.com/",
+            })
+            response.raise_for_status()
+            contentType = (response.headers.get("content-type") or b"").decode().lower()
+            if "application/json" not in contentType:
+                return True
+
+            payload = await response.json()
+            if payload.get("code") == 0 and payload.get("status") is True:
+                return True
+
+            raise ValueError(payload.get("message") or "退出登录失败")
+        finally:
+            client.close()
+
+    async def _fetchAccountInfo(self) -> dict:
+        cookie = self.cookie
+        if not cookie:
+            return {"isLoggedIn": False, "uname": ""}
+
+        client = buildClient(headers={"cookie": cookie})
+        try:
+            response = await client.get(LOGIN_INFO_API)
+            response.raise_for_status()
+            payload = await response.json()
+            data = payload.get("data") or {}
+
+            if payload.get("code") == -101 or not data.get("isLogin"):
+                return {"isLoggedIn": False, "uname": ""}
+
+            if payload.get("code") not in {None, 0}:
+                raise ValueError(payload.get("message") or "获取登录信息失败")
+
+            vipPayload = data.get("vip") or {}
+            vipStatus = int(data.get("vipStatus") or vipPayload.get("status") or 0)
+            if vipStatus != 1:
+                vipText = "未开通"
+            else:
+                vipLabel = ((vipPayload.get("label") or {}).get("text")
+                            or (data.get("vip_label") or {}).get("text") or "").strip()
+                if vipLabel:
+                    vipText = vipLabel
+                else:
+                    vipType = int(data.get("vipType") or vipPayload.get("type") or 0)
+                    vipText = {1: "月度大会员", 2: "年度大会员"}.get(vipType, "大会员")
+
+            return {
+                "isLoggedIn": True,
+                "uname": str(data.get("uname") or "").strip(),
+                "mid": str(data.get("mid") or ""),
+                "vip": vipText,
+                "wbiData": data,
+            }
+        finally:
+            client.close()
+
+    def _onLogoutDone(self, shouldClear: bool):
+        if shouldClear:
+            from app.config.cfg import cfg
+            cfg.set(bilibiliConfig.userCookie, "")
+            self._username = ""
+            self._mid = ""
+            self._vip = ""
+            self.accountChanged.emit()
+
+    def _onLogoutFailed(self, error: str):
+        self.accountChanged.emit()
+
+    def _onAccountInfoDone(self, result: dict):
+        self._username = result.get("uname", "")
+        self._mid = result.get("mid", "")
+        self._vip = result.get("vip", "")
+        wbiData = result.get("wbiData")
+        if wbiData:
+            self._updateWbiKeys(wbiData)
+        self.accountChanged.emit()
+
+    # ── SMS login (caller blocks on the engine loop) ──
+
+    async def fetchCaptcha(self) -> dict:
+        client = buildClient()
+        try:
+            response = await client.get(CAPTCHA_API, query={"source": SMS_SOURCE})
+            response.raise_for_status()
+            payload = await response.json()
+            if payload.get("code") not in {None, 0}:
+                raise ValueError(payload.get("message") or "获取验证码失败")
+
+            data = payload.get("data") or {}
+            geetest = data.get("geetest") or {}
+            gt = str(geetest.get("gt") or "")
+            challenge = str(geetest.get("challenge") or "")
+            self._captchaToken = str(data.get("token") or "")
+            if not gt or not challenge or not self._captchaToken:
+                raise ValueError("验证码接口返回了不完整的数据")
+            return {"gt": gt, "challenge": challenge}
+        finally:
+            client.close()
+
+    async def fetchCountries(self) -> dict:
+        client = buildClient()
+        try:
+            response = await client.get(COUNTRY_LIST_API)
+            response.raise_for_status()
+            payload = await response.json()
+            data = payload.get("data") or {}
+            countries = []
+            for entry in (data.get("common") or []) + (data.get("others") or []):
+                cid = str(entry.get("country_id") or "")
+                if not cid.isdigit():
+                    continue
+                name = str(entry.get("country_name") or "").strip()
+                countries.append({"cid": int(cid), "label": f"{name} +{cid}" if name else f"+{cid}"})
+            return {"defaultCid": await self._fetchZone(client), "countries": countries}
+        finally:
+            client.close()
+
+    async def _fetchZone(self, client) -> int:
+        try:
+            response = await client.get(ZONE_API)
+            response.raise_for_status()
+            payload = await response.json()
+        except Exception:
+            return DEFAULT_ZONE
+        return int((payload.get("data") or {}).get("country_code") or DEFAULT_ZONE)
+
+    async def sendSmsCode(self, cid: int, tel: str, captcha: dict):
+        client = buildClient(headers=PASSPORT_HEADERS)
+        try:
+            response = await client.post(SMS_SEND_API, query={
+                "cid": str(cid), "tel": tel, "token": self._captchaToken,
+                "source": SMS_SOURCE,
+                "challenge": str(captcha.get("challenge") or ""),
+                "validate": str(captcha.get("validate") or ""),
+                "seccode": str(captcha.get("seccode") or ""),
+            })
+            response.raise_for_status()
+            payload = await response.json()
+            key = str((payload.get("data") or {}).get("captcha_key") or "")
+            if payload.get("code") != 0 or not key:
+                raise ValueError(payload.get("message") or "验证码发送失败")
+            self._smsCaptchaKey = key
+        finally:
+            client.close()
+
+    async def loginSms(self, cid: int, tel: str, code: str):
+        client = buildClient(headers=PASSPORT_HEADERS)
+        try:
+            response = await client.post(SMS_LOGIN_API, query={
+                "cid": str(cid), "tel": tel, "code": code,
+                "source": SMS_SOURCE,
+                "captcha_key": self._smsCaptchaKey,
+                "keep": "true",
+            })
+            response.raise_for_status()
+            payload = await response.json()
+            data = payload.get("data") or {}
+            if int(data.get("status", -1)) != 0:
+                raise ValueError(str(data.get("message") or "登录失败"))
+
+            items = cookiesFrom(response)
+            if not items:
+                raise ValueError("登录成功，但未能提取到有效 Cookie")
+            self.setCookie(toCookie("; ".join(f"{k}={v}" for k, v in items.items())))
+        finally:
+            client.close()
+
+

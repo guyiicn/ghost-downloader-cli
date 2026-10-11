@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import asyncio
+import errno
+import socket
+import sys
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from enum import StrEnum
+
+from loguru import logger
+
+from app.models.task import TaskError
+from app.signal import Signal
+
+Handle = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
+
+
+class ListenStatus(StrEnum):
+    OFF = "off"
+    STARTING = "starting"
+    LISTENING = "listening"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class ListenState:
+    status: ListenStatus = ListenStatus.OFF
+    port: int = 0
+    error: TaskError | None = None
+
+
+def toListenError(error: OSError, port: int) -> TaskError:
+    if error.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", None)):
+        return TaskError("端口 {port} 被占用，请更换端口", port=port)
+    if error.errno in (errno.EACCES, getattr(errno, "WSAEACCES", None)):
+        return TaskError("没有权限监听端口 {port}，请更换端口", port=port)
+    return TaskError("无法监听端口 {port}，详情见日志", port=port)
+
+
+def createSocket(host: str, port: int) -> socket.socket:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if sys.platform != "win32":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        sock.bind((host, port))
+        sock.listen()
+        sock.setblocking(False)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+class PortListener:
+    stateChanged = Signal(object)
+
+    def __init__(self, coroutineRunner, handle: Handle, *, isEnabled, port) -> None:
+        self._coroutineRunner = coroutineRunner
+        self._handle = handle
+        self._isEnabled = isEnabled
+        self._port = port
+        self._state = ListenState()
+        self._servers: list[asyncio.Server] = []
+        self._connections: set[asyncio.Task] = set()
+        self._lock: asyncio.Lock | None = None
+
+    @property
+    def state(self) -> ListenState:
+        return self._state
+
+    def start(self) -> None:
+        self._isEnabled.valueChanged.connect(self._onConfigChanged)
+        self._port.valueChanged.connect(self._onConfigChanged)
+        self._onConfigChanged()
+
+    def stop(self) -> None:
+        self._isEnabled.valueChanged.disconnect(self._onConfigChanged)
+        self._port.valueChanged.disconnect(self._onConfigChanged)
+        self._request(None)
+
+    def _onConfigChanged(self, *_) -> None:
+        self._request(self._port.value if self._isEnabled.value else None)
+
+    def _request(self, port: int | None) -> None:
+        if port is not None:
+            self._setState(ListenState(ListenStatus.STARTING, port))
+        self._coroutineRunner.submit(self._run(port), done=self._setState)
+
+    def _setState(self, state: ListenState) -> None:
+        if state == self._state:
+            return
+        self._state = state
+        self.stateChanged.emit(state)
+
+    async def _run(self, port: int | None) -> ListenState:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            await self._close()
+            if port is None:
+                return ListenState()
+            return await self._open(port)
+
+    async def _open(self, port: int) -> ListenState:
+        try:
+            sockets = [createSocket("127.0.0.1", port)]
+        except OSError as e:
+            logger.error("Port listener failed to bind 127.0.0.1:{}: {}", port, e)
+            return ListenState(ListenStatus.FAILED, port, error=toListenError(e, port))
+        try:
+            sockets.append(createSocket("::1", port))
+        except OSError as e:
+            logger.warning("Port listener failed to bind [::1]:{}: {}", port, e)
+
+        for sock in sockets:
+            self._servers.append(await asyncio.start_server(self._onConnection, sock=sock))
+        return ListenState(ListenStatus.LISTENING, port)
+
+    async def _close(self) -> None:
+        servers, self._servers = self._servers, []
+        for server in servers:
+            server.close()
+        connections = list(self._connections)
+        for task in connections:
+            task.cancel()
+        await asyncio.gather(*connections, return_exceptions=True)
+        for server in servers:
+            await server.wait_closed()
+
+    async def _onConnection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        self._connections.add(task)
+        try:
+            await self._handle(reader, writer)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.opt(exception=e).warning("Port listener connection failed")
+        finally:
+            self._connections.discard(task)
+            writer.close()

@@ -1,0 +1,758 @@
+from __future__ import annotations
+
+import asyncio
+import shutil
+from contextlib import suppress
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from loguru import logger
+
+from app.models.task import Task, TaskError, TaskFile, TaskStep, TaskStatus, SpecialFileSize, deletePlaceholder
+
+from app.platform.filesystem import toSafeFilename
+from app.i18n import N
+from http_pack.task import HttpTaskStep
+from ffmpeg_pack.task import FFmpegStep
+from .stream import buildSize, fetchPlayurl, probeSize, toStreamUrl
+
+AUDIO_QUALITY_LABELS = {30216: "64K", 30232: "132K", 30280: "192K", 30250: "杜比全景声", 30251: "Hi-Res"}
+CODEC_NAMES = {7: "H.264", 12: "H.265", 13: "AV1"}
+
+
+def streamPage(task: BilibiliTask) -> BiliPage | None:
+    return next((p for p in task.files or [] if p._videoStreams or p._audioStreams), None)
+
+
+def videoTiers(task: BilibiliTask) -> list[tuple[str, str]]:
+    page = streamPage(task)
+    if page is None:
+        return []
+    qualityMap = dict(zip(task._acceptQualities, task._qualityLabels))
+    tiers = []
+    for s in page._videoStreams:
+        kbps = s["bandwidth"] / 1000
+        bitrate = f"{kbps / 1000:.1f}Mbps" if kbps >= 1000 else f"{int(kbps)}Kbps"
+        codec = CODEC_NAMES.get(s["codecid"], "")
+        name = qualityMap.get(s["id"], str(s["id"]))
+        tiers.append((f'{s["id"]}-{s["codecid"]}', f"{name} ({codec}, {bitrate})"))
+    return tiers
+
+
+def audioTiers(task: BilibiliTask) -> list[tuple[str, str]]:
+    page = streamPage(task)
+    if page is None:
+        return []
+    tiers = []
+    seen = set()
+    for s in page._audioStreams:
+        if s["id"] in seen:
+            continue
+        seen.add(s["id"])
+        name = AUDIO_QUALITY_LABELS.get(s["id"], str(s["id"]))
+        tiers.append((str(s["id"]), f'{name} ({s["bandwidth"] // 1000}Kbps)'))
+    return tiers
+
+
+def currentVideoTier(task: BilibiliTask) -> str:
+    page = streamPage(task)
+    if page is None:
+        return ""
+    return next(
+        (f'{s["id"]}-{s["codecid"]}'
+         for s in page._videoStreams if toStreamUrl(s) == page.videoUrl),
+        "",
+    )
+
+
+def currentAudioTier(task: BilibiliTask) -> str:
+    page = streamPage(task)
+    if page is None:
+        return ""
+    return next(
+        (str(s["id"]) for s in page._audioStreams if toStreamUrl(s) == page.audioUrl), "",
+    )
+
+
+def subtitleChoices(task: BilibiliTask) -> list[tuple[str, str]]:
+    seen = set()
+    choices = []
+    for page in task.files or []:
+        for sub in page.subtitles:
+            lan = sub.get("lan", "")
+            if not lan or lan in seen:
+                continue
+            seen.add(lan)
+            label = sub.get("lan_doc", lan)
+            if sub.get("isAi"):
+                label += N("BilibiliDraftCard", "（自动生成）")
+            choices.append((lan, label))
+    return choices
+
+
+def buildTimeSuffix(startTime: int, endTime: int) -> str:
+    def fmt(sec: int) -> str:
+        m, s = divmod(sec, 60)
+        return f"{m:02d}m{s:02d}s"
+    return f"[{fmt(startTime)}-{fmt(endTime)}]"
+
+
+def parseSegmentBaseEndByte(streams: list[dict], url: str) -> int:
+    for s in streams:
+        if toStreamUrl(s) == url:
+            segBase = s.get("SegmentBase") or s.get("segment_base") or {}
+            indexRange = segBase.get("indexRange") or segBase.get("index_range") or ""
+            if indexRange and "-" in indexRange:
+                return int(indexRange.split("-")[1])
+    return 4095
+
+
+def toResourcePath(task: Task, fileIndex: int, role: str) -> Path:
+    return task.partPath / task.toSidePath(fileIndex, f"{role}.m4s").name
+
+
+def pageByIndex(task: BilibiliTask, fileIndex: int) -> BiliPage | None:
+    return next((f for f in task.files or [] if f.index == fileIndex), None)
+
+
+def setEpisodeTitle(pages: list[BiliPage], name: str) -> None:
+    name = name.strip()
+    if not pages or not name:
+        return
+    for page in pages:
+        page.episodeTitle = name
+
+
+def setTimeRanges(pages: list[BiliPage], ranges: dict[int, tuple[int, int]]) -> None:
+    for page in pages:
+        if page.index in ranges:
+            page.startTime, page.endTime = ranges[page.index]
+
+
+def setPagePart(page: BiliPage, name: str) -> None:
+    page.pagePart = name.strip()
+
+
+def setFileName(task: BilibiliTask, index: int, name: str) -> None:
+    page = pageByIndex(task, index)
+    if page is None:
+        return
+    episode = [p for p in task.files or [] if p.bvid == page.bvid]
+    if page.episodeTitle and len(episode) == 1:
+        setEpisodeTitle(episode, name)
+    else:
+        setPagePart(page, name)
+    task.update()
+
+
+@dataclass(kw_only=True)
+class BiliPage(TaskFile):
+    cid: int = 0
+    pagePart: str = ""
+    pageNumber: int = 1
+    bvid: str = ""
+    episodeTitle: str = ""
+    sectionTitle: str = ""
+    coverUrl: str = ""
+    videoUrl: str = ""
+    audioUrl: str = ""
+    videoSize: int = 0
+    audioSize: int = 0
+    startTime: int = 0
+    endTime: int = 0
+    headers: dict = field(default_factory=dict)
+    subworkerCount: int = 8
+    subtitles: list[dict] = field(default_factory=list)
+    _duration: int = field(default=0, repr=False)
+    _videoStreams: list[dict] = field(default_factory=list, repr=False)
+    _audioStreams: list[dict] = field(default_factory=list, repr=False)
+
+
+@dataclass(kw_only=True, eq=False)
+class BilibiliTask(Task):
+    packId: str = "bili"
+    canEdit = True
+    fileType = BiliPage
+    coverUrl: str = ""
+    coverSize: int = 0
+    isVideoEnabled: bool = True
+    isAudioEnabled: bool = True
+    isCoverEnabled: bool = False
+    subtitleLanguages: list[str] = field(default_factory=list)
+    requestedQn: int = 0
+    requestedCodecid: int = 0
+    requestedAudioQn: int = 0
+    _baseName: str = ""
+    _acceptQualities: list[int] = field(default_factory=list, repr=False)
+    _qualityLabels: list[str] = field(default_factory=list, repr=False)
+
+    def __post_init__(self):
+        super().__post_init__()
+        if any(not f.relativePath.endswith((".mp4", ".m4a")) for f in self.files or []):
+            self._baseName = self._baseName or Path(self.name).stem
+            if self.status == TaskStatus.COMPLETED:
+                self.updateNames()
+            else:
+                self.update()
+
+    @property
+    def outputPath(self) -> str:
+        if self.isOutputFolder:
+            return str(self.outputFolder / Path(self.name).stem)
+        return super().outputPath
+
+    @property
+    def isSeason(self) -> bool:
+        files = self.files or []
+        return any(f.episodeTitle for f in files) or len({f.bvid for f in files if f.bvid}) > 1
+
+    def episodeGroups(self) -> list[list[BiliPage]]:
+        groups: dict[str, list[BiliPage]] = {}
+        order: list[str] = []
+        for page in self.files or []:
+            key = page.bvid or f"#{page.index}"
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(page)
+        return [groups[k] for k in order]
+
+    @property
+    def hasAudio(self) -> bool:
+        return any(f.audioUrl or f._audioStreams for f in self.files or [])
+
+    def seasonCounts(self) -> tuple[int, int]:
+        groups = self.episodeGroups()
+        selected = sum(1 for g in groups if any(p.selected for p in g))
+        return selected, len(groups)
+
+    def setSelection(self, selectedIndexes) -> None:
+        super().setSelection(selectedIndexes)
+        if self.isCoverEnabled:
+            self.fileSize += self.coverSize
+        have = {s.fileIndex for s in self.steps if s.fileIndex is not None}
+        stepIndex = max((s.stepIndex for s in self.steps), default=0)
+        for file in (self.files or []):
+            if file.selected and file.index not in have:
+                stepIndex = self._addFileSteps(file, stepIndex)
+        self._addCoverSteps(stepIndex)
+        self.updateNames()
+        self.updateStatus()
+
+    def toDisplayPath(self, file: BiliPage) -> str:
+        isEpisode = file.episodeTitle and sum(1 for p in self.files or [] if p.bvid == file.bvid) == 1
+        return toSafeFilename(file.episodeTitle if isEpisode else file.pagePart, fallback=f"P{file.pageNumber}")
+
+    def updateNames(self) -> None:
+        extension = "mp4" if self.isVideoEnabled else "m4a"
+        for page in self.files or []:
+            stem = f"{Path(self.name).stem}{self._pageSuffix(page)}"
+            page.relativePath = toSafeFilename(f"{stem}.{extension}", fallback=f"P{page.pageNumber}.{extension}")
+
+    def setName(self, name: str):
+        super().setName(name)
+        self._baseName = Path(self.name).stem
+
+    def setVideoQuality(self, qn: int, codecid: int) -> None:
+        self.requestedQn = qn
+        self.requestedCodecid = codecid
+        template = None
+        for page in (self.files or []):
+            stream = next((s for s in page._videoStreams if s["id"] == qn and s["codecid"] == codecid), None)
+            if stream and toStreamUrl(stream):
+                template = stream
+                page.videoUrl = toStreamUrl(stream)
+                page.videoSize = buildSize(stream, page._duration)
+        if template:
+            for page in (self.files or []):
+                if not page._videoStreams:
+                    page.videoUrl = ""
+                    page.videoSize = buildSize(template, page._duration)
+        self.update()
+
+    def setAudioQuality(self, qn: int) -> None:
+        self.requestedAudioQn = qn
+        template = None
+        for page in (self.files or []):
+            stream = next((s for s in page._audioStreams if s["id"] == qn), None)
+            if stream and toStreamUrl(stream):
+                template = stream
+                page.audioUrl = toStreamUrl(stream)
+                page.audioSize = buildSize(stream, page._duration)
+        if template:
+            for page in (self.files or []):
+                if not page._audioStreams:
+                    page.audioUrl = ""
+                    page.audioSize = buildSize(template, page._duration)
+        self.update()
+
+    def setSubtitleLanguages(self, languages: list[str]) -> None:
+        self.subtitleLanguages = languages
+        self.update()
+
+    def update(self) -> None:
+        self.steps.clear()
+        files: list[BiliPage] = self.files or []
+
+        timeSuffix = ""
+        if len(files) == 1 and (files[0].startTime or files[0].endTime):
+            timeSuffix = f" {buildTimeSuffix(files[0].startTime, files[0].endTime)}"
+
+        if self.isVideoEnabled:
+            self.name = toSafeFilename(f"{self._baseName}{timeSuffix}.mp4", fallback="video.mp4")
+        elif self.isAudioEnabled:
+            self.name = toSafeFilename(f"{self._baseName}{timeSuffix}.m4a", fallback="audio.m4a")
+        elif self.isCoverEnabled:
+            self.name = toSafeFilename(f"{self._baseName}.jpg", fallback="cover.jpg")
+        else:
+            for file in files:
+                file.size = 0
+            self.fileSize = 0
+            return
+        self.updateNames()
+
+        for file in files:
+            fullSize = (file.videoSize if self.isVideoEnabled else 0) + (file.audioSize if self.isAudioEnabled else 0)
+            if (file.startTime or file.endTime) and file._duration > 0:
+                fullSize = int(fullSize * (file.endTime - file.startTime) / file._duration)
+            file.size = fullSize
+        self.fileSize = sum(f.size for f in files if f.selected) + (self.coverSize if self.isCoverEnabled else 0)
+
+        stepIndex = 0
+        for file in files:
+            if file.selected:
+                stepIndex = self._addFileSteps(file, stepIndex)
+        self._addCoverSteps(stepIndex)
+        self.updateStatus()
+
+    def _addCoverSteps(self, stepIndex: int) -> int:
+        if not self.isCoverEnabled:
+            return stepIndex
+        have = {s.fileIndex for s in self.steps if isinstance(s, BilibiliCoverStep)}
+        covers: list[tuple[str, int, int | None]] = []
+        if self.coverUrl:
+            covers.append((self.coverUrl, self.coverSize, None))
+        if self.isSeason:
+            seen: set[str] = set()
+            for page in self.files or []:
+                if not page.selected or not page.coverUrl:
+                    continue
+                key = page.bvid or f"#{page.index}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                covers.append((page.coverUrl, 0, page.index))
+        referer = next((p.headers.get("referer") for p in (self.files or []) if p.headers.get("referer")), "")
+        headers = {"referer": referer} if referer else {}
+        for url, size, fileIndex in covers:
+            if fileIndex in have:
+                continue
+            stepIndex += 1
+            self.steps.append(BilibiliCoverStep(
+                stepIndex=stepIndex,
+                url=url,
+                fileSize=size,
+                headers=headers,
+                canUseRangeRequests=size > 0,
+                subworkerCount=1,
+                fileIndex=fileIndex,
+            ))
+            self.steps[-1]._bindTask(self)
+            have.add(fileIndex)
+        return stepIndex
+
+    def _addFileSteps(self, file: BiliPage, stepIndex: int) -> int:
+        useAudio = self.isAudioEnabled and (self.hasAudio or len(self.files or []) > 1)
+        needsMerge = self.isVideoEnabled and useAudio
+        fileTrim = bool(file.startTime or file.endTime)
+        if self.isVideoEnabled:
+            stepIndex += 1
+            self.steps.append(BilibiliVideoStep(
+                stepIndex=stepIndex,
+                url=file.videoUrl,
+                fileSize=file.videoSize,
+                headers=dict(file.headers),
+                subworkerCount=file.subworkerCount,
+                canUseRangeRequests=True,
+                fileIndex=file.index,
+            ))
+            self.steps[-1]._bindTask(self)
+        if useAudio:
+            stepIndex += 1
+            self.steps.append(BilibiliAudioStep(
+                stepIndex=stepIndex,
+                url=file.audioUrl,
+                fileSize=file.audioSize,
+                headers=dict(file.headers),
+                subworkerCount=file.subworkerCount,
+                canUseRangeRequests=True,
+                fileIndex=file.index,
+            ))
+            self.steps[-1]._bindTask(self)
+        if needsMerge or fileTrim:
+            stepIndex += 1
+            self.steps.append(BilibiliMergeStep(
+                stepIndex=stepIndex,
+                fileIndex=file.index,
+            ))
+            self.steps[-1]._bindTask(self)
+        if self.isVideoEnabled or self.isAudioEnabled:
+            for language in self.subtitleLanguages:
+                stepIndex += 1
+                self.steps.append(BilibiliSubtitleStep(
+                    stepIndex=stepIndex,
+                    fileIndex=file.index,
+                    language=language,
+                ))
+                self.steps[-1]._bindTask(self)
+        return stepIndex
+
+    def _pageSuffix(self, page: BiliPage) -> str:
+        if len(self.files or []) <= 1:
+            return ""
+        if page.episodeTitle:
+            title = toSafeFilename(page.episodeTitle, fallback=page.bvid or "video")
+            same = sum(1 for f in (self.files or []) if f.bvid == page.bvid)
+            if same > 1:
+                suffix = f" - {title} - P{page.pageNumber}"
+                part = toSafeFilename(page.pagePart.strip(), fallback="") if page.pagePart.strip() else ""
+                if part and part != title:
+                    suffix += f" {part}"
+            else:
+                suffix = f" - {title}"
+        else:
+            suffix = f" - P{page.pageNumber}"
+            part = page.pagePart.strip()
+            if part and part != self._baseName:
+                suffix += f" {toSafeFilename(part, fallback=part)}"
+        if page.startTime or page.endTime:
+            suffix += f" {buildTimeSuffix(page.startTime, page.endTime)}"
+        return suffix
+
+
+@dataclass(kw_only=True)
+class BilibiliCoverStep(HttpTaskStep):
+
+    @property
+    def outputPath(self) -> str:
+        return str(self.task.toSidePath(self.fileIndex, "jpg"))
+
+
+@dataclass(kw_only=True)
+class BilibiliVideoStep(HttpTaskStep):
+    fileIndex: int = 0
+
+    @property
+    def outputPath(self) -> str:
+        page = pageByIndex(self.task, self.fileIndex)
+        hasTrim = page is not None and bool(page.startTime or page.endTime)
+        if (self.task.isAudioEnabled and (self.task.hasAudio or len(self.task.files or []) > 1)) or hasTrim:
+            return str(toResourcePath(self.task, self.fileIndex, "video"))
+        return str(self.task.toFilePath(self.fileIndex))
+
+    async def run(self, reportSpeed, waitForSpeedLimit) -> None:
+        page = pageByIndex(self.task, self.fileIndex)
+        if page and not page.videoUrl:
+            from .config import bilibiliConfig
+            qn = self.task.requestedQn or bilibiliConfig.defaultQuality.value
+            _, _, usedQn = await fetchPlayurl(
+                page, qn=qn, headers=page.headers, audioQn=self.task.requestedAudioQn,
+            )
+            self.task.requestedQn = usedQn
+        if page:
+            self.url = page.videoUrl
+            self.fileSize = page.videoSize
+            self.headers = dict(page.headers)
+        if not self.url:
+            raise TaskError("未获取到视频流地址")
+        if page and (page.startTime or page.endTime):
+            await self._updateSegmentRange(page)
+        else:
+            size = await probeSize(self.url, self.headers)
+            self.fileSize = size if size > 0 else SpecialFileSize.UNKNOWN
+        await super().run(reportSpeed, waitForSpeedLimit)
+
+    async def _updateSegmentRange(self, page: BiliPage) -> None:
+        from app.client import buildClient
+        from app.container import buildMp4SegmentRange
+
+        endByte = parseSegmentBaseEndByte(page._videoStreams, self.url)
+        client = buildClient()
+        try:
+            headers = {**self.headers, "range": f"bytes=0-{endByte}", "accept-encoding": "identity"}
+            response = await client.get(self.url, headers=headers)
+            try:
+                headerData = await response.bytes()
+            finally:
+                response.close()
+        finally:
+            client.close()
+
+        try:
+            segRange = buildMp4SegmentRange(headerData, page.startTime, page.endTime)
+        except Exception as e:
+            logger.warning("segment range parsing failed for {}: {}", self.url, e)
+            return
+
+        self.httpByteOffset = segRange.segStart
+        self.fileSize = segRange.segEnd - segRange.segStart
+
+        for mergeStep in self.task.steps:
+            if isinstance(mergeStep, BilibiliMergeStep) and mergeStep.fileIndex == self.fileIndex:
+                mergeStep.patchedVideoHeader = segRange.patchedHeader
+                mergeStep.segStartTime = segRange.segStartTime
+                break
+
+
+@dataclass(kw_only=True)
+class BilibiliAudioStep(HttpTaskStep):
+    fileIndex: int = 0
+
+    @property
+    def outputPath(self) -> str:
+        page = pageByIndex(self.task, self.fileIndex)
+        hasTrim = page is not None and bool(page.startTime or page.endTime)
+        if self.task.isVideoEnabled or hasTrim:
+            return str(toResourcePath(self.task, self.fileIndex, "audio"))
+        return str(self.task.toFilePath(self.fileIndex))
+
+    async def run(self, reportSpeed, waitForSpeedLimit) -> None:
+        page = pageByIndex(self.task, self.fileIndex)
+        if page and not page.audioUrl:
+            from .config import bilibiliConfig
+            qn = self.task.requestedQn or bilibiliConfig.defaultQuality.value
+            _, _, usedQn = await fetchPlayurl(
+                page, qn=qn, headers=page.headers, audioQn=self.task.requestedAudioQn,
+            )
+            self.task.requestedQn = usedQn
+        if page:
+            self.url = page.audioUrl
+            self.fileSize = page.audioSize
+            self.headers = dict(page.headers)
+        if not self.url:
+            return
+        if page and (page.startTime or page.endTime):
+            await self._updateSegmentRange(page)
+        else:
+            size = await probeSize(self.url, self.headers)
+            self.fileSize = size if size > 0 else SpecialFileSize.UNKNOWN
+        await super().run(reportSpeed, waitForSpeedLimit)
+
+    async def _updateSegmentRange(self, page: BiliPage) -> None:
+        from app.client import buildClient
+        from app.container import buildMp4SegmentRange
+
+        endByte = parseSegmentBaseEndByte(page._audioStreams, self.url)
+        client = buildClient()
+        try:
+            headers = {**self.headers, "range": f"bytes=0-{endByte}", "accept-encoding": "identity"}
+            response = await client.get(self.url, headers=headers)
+            try:
+                headerData = await response.bytes()
+            finally:
+                response.close()
+        finally:
+            client.close()
+
+        try:
+            segRange = buildMp4SegmentRange(headerData, page.startTime, page.endTime)
+        except Exception as e:
+            logger.warning("segment range parsing failed for {}: {}", self.url, e)
+            return
+
+        self.httpByteOffset = segRange.segStart
+        self.fileSize = segRange.segEnd - segRange.segStart
+
+        for mergeStep in self.task.steps:
+            if isinstance(mergeStep, BilibiliMergeStep) and mergeStep.fileIndex == self.fileIndex:
+                mergeStep.patchedAudioHeader = segRange.patchedHeader
+                mergeStep.segStartTime = segRange.segStartTime
+                break
+
+
+@dataclass(kw_only=True)
+class BilibiliMergeStep(FFmpegStep):
+    fileIndex: int = 0
+    patchedVideoHeader: bytes = field(default=b"", repr=False)
+    patchedAudioHeader: bytes = field(default=b"", repr=False)
+    segStartTime: float = field(default=0.0, repr=False)
+
+    @property
+    def outputPath(self) -> str:
+        return str(self.task.toFilePath(self.fileIndex))
+
+    @property
+    def _videoPath(self) -> Path:
+        return toResourcePath(self.task, self.fileIndex, "video")
+
+    @property
+    def _audioPath(self) -> Path:
+        return toResourcePath(self.task, self.fileIndex, "audio")
+
+    @property
+    def _timeRange(self) -> tuple[int, int] | None:
+        page = pageByIndex(self.task, self.fileIndex)
+        if page and (page.startTime or page.endTime):
+            return page.startTime, page.endTime
+        return None
+
+    def _buildTrimArgs(self) -> tuple[list[str], list[str]]:
+        tr = self._timeRange
+        if not tr:
+            return [], []
+        relSS = tr[0] - self.segStartTime
+        return ["-ss", str(relSS)], ["-t", str(tr[1] - tr[0])]
+
+    async def run(self, reportSpeed, waitForSpeedLimit) -> None:
+        for header, path in [
+            (self.patchedVideoHeader, self._videoPath),
+            (self.patchedAudioHeader, self._audioPath),
+        ]:
+            if header and path.exists():
+                tmp = path.with_suffix(".tmp")
+                with open(tmp, "wb") as f:
+                    f.write(header)
+                    with open(path, "rb") as seg:
+                        shutil.copyfileobj(seg, f)
+                tmp.replace(path)
+
+        hasVideo = self._videoPath.exists()
+        hasAudio = self._audioPath.exists()
+
+        if hasVideo and hasAudio:
+            if self._timeRange:
+                await self._runWithTrim()
+            else:
+                await super().run(reportSpeed, waitForSpeedLimit)
+            return
+
+        singleInput = self._videoPath if hasVideo else self._audioPath if hasAudio else None
+        if not singleInput:
+            deletePlaceholder(Path(self.outputPath))
+            return
+
+        if self._timeRange:
+            await self._runWithTrim()
+        else:
+            singleInput.replace(self.outputPath)
+
+    async def _runWithTrim(self) -> None:
+        from ffmpeg_pack.config import ffmpegRuntime
+        from app.platform.filesystem import deletePath
+
+        ffmpegPath = ffmpegRuntime.path()
+        ffprobePath = ffmpegRuntime.ffprobePath()
+        if not ffmpegPath or not ffprobePath:
+            raise TaskError("{name} 未安装，请在设置中安装", name="FFmpeg")
+
+        probeInput = self._videoPath if self._videoPath.exists() else self._audioPath
+        totalDuration = await self._probeDuration(ffprobePath, probeInput)
+
+        preArgs, postArgs = self._buildTrimArgs()
+        args = [ffmpegPath, "-y", "-v", "error", "-nostats", "-progress", "pipe:1"]
+        for path in (self._videoPath, self._audioPath):
+            if path.exists():
+                args.extend([*preArgs, "-i", str(path)])
+        args.extend([*postArgs, "-c", "copy", "-f", "mp4", self.outputPath])
+
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        progressTask = asyncio.create_task(self._readProgress(process.stdout, totalDuration))
+
+        try:
+            await process.wait()
+            await progressTask
+
+            if process.returncode != 0:
+                stderr = (await process.stderr.read()).decode("utf-8", errors="ignore").strip()
+                raise TaskError(
+                    "FFmpeg 合并失败（{code}）：{detail}",
+                    code=process.returncode,
+                    detail=stderr or "unknown error",
+                )
+
+            if self.shouldDeleteSource:
+                for path in (self._videoPath, self._audioPath):
+                    if path.exists():
+                        deletePath(path)
+        except asyncio.CancelledError:
+            self.setStatus(TaskStatus.PAUSED)
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            if not progressTask.done():
+                progressTask.cancel()
+                with suppress(asyncio.CancelledError):
+                    await progressTask
+            raise
+
+
+@dataclass(kw_only=True)
+class BilibiliSubtitleStep(TaskStep):
+    canPause = False
+    fileIndex: int = 0
+    language: str = ""
+
+    @property
+    def outputPath(self) -> str:
+        return str(self.task.toSidePath(self.fileIndex, f"{toSafeFilename(self.language, fallback='subtitle')}.srt"))
+
+    async def run(self, reportSpeed, waitForSpeedLimit) -> None:
+        from app.client import buildClient
+
+        page = pageByIndex(self.task, self.fileIndex)
+        pageHeaders = dict(page.headers) if page and page.headers else {}
+        referer = pageHeaders.get("referer") or "https://www.bilibili.com"
+        cookie = pageHeaders.get("cookie") or ""
+        listHeaders = {"referer": referer}
+        if cookie:
+            listHeaders["cookie"] = cookie
+
+        if page and not page.subtitles:
+            from .stream import fetchSubtitles
+            subClient = buildClient(emulation=None, headers=listHeaders)
+            try:
+                page.subtitles = await fetchSubtitles(subClient, page)
+            finally:
+                subClient.close()
+        subtitle = next((s for s in (page.subtitles if page else []) if s["lan"] == self.language), None)
+        url = subtitle.get("subtitle_url", "") if subtitle else ""
+        if not url:
+            deletePlaceholder(Path(self.outputPath))
+            return
+        if url.startswith("//"):
+            url = "https:" + url
+
+        def toSrtTime(seconds: float) -> str:
+            total_ms = int(round(seconds * 1000))
+            h, rem = divmod(total_ms // 1000, 3600)
+            m, s = divmod(rem, 60)
+            return f"{h:02d}:{m:02d}:{s:02d},{total_ms % 1000:03d}"
+
+        client = buildClient(headers={"referer": referer})
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            payload = await response.json()
+        except Exception as e:
+            raise TaskError("字幕下载失败") from e
+        finally:
+            client.close()
+
+        lines: list[str] = []
+        seq = 0
+        for entry in payload.get("body") or []:
+            content = str(entry.get("content", "")).strip()
+            if not content:
+                continue
+            seq += 1
+            lines.append(str(seq))
+            lines.append(f"{toSrtTime(float(entry.get('from', 0)))} --> {toSrtTime(float(entry.get('to', 0)))}")
+            lines.append(content)
+            lines.append("")
+        if seq:
+            Path(self.outputPath).write_text("\n".join(lines), encoding="utf-8")

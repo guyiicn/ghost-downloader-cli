@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+import asyncio
+from base64 import b64encode
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse
+
+import libtorrent as lt
+
+from app.i18n import N
+
+from app.models.pack import FeaturePack, TaskParser, FileType, UriScheme
+from app.models.task import Task, TaskOptions
+from app.platform.filesystem import localFilePath, toSafeFilename
+
+from .config import bittorrentConfig
+from .session import PROXY_SCHEMES, btSession
+from .task import BTFile, BTTask, BTTaskStep, BTTorrentFileStep
+from .trackers import mergedTrackers, trackerList
+
+
+def refreshTrackerListIfStale() -> None:
+    if bittorrentConfig.autoRefreshWebTrackers.value and trackerList.isStale():
+        asyncio.ensure_future(trackerList.refresh())
+
+
+class TorrentParser(TaskParser):
+    priority = 85
+
+    def match(self, options: TaskOptions) -> bool:
+        url = options.url.strip()
+        if urlparse(url).scheme.lower() == "magnet":
+            return True
+        return localFilePath(url, {".torrent"}) is not None
+
+    async def parse(self, options: TaskOptions) -> Task:
+        url = options.url.strip()
+        outputFolder = options.outputFolder
+
+        refreshTrackerListIfStale()
+        webTrackers = mergedTrackers() if bittorrentConfig.enableWebTrackers.value else []
+
+        localPath = localFilePath(url, {".torrent"})
+        if localPath is not None:
+            torrentBytes = await asyncio.to_thread(localPath.resolve().read_bytes)
+            sourceType, sourceUrl = "torrent", str(localPath.resolve())
+
+        elif urlparse(url).scheme.lower() == "magnet":
+            magnetTrackers = list(lt.parse_magnet_uri(url).trackers)
+            torrentBytes = await btSession.fetchMetadata(url, webTrackers)
+            sourceType, sourceUrl = "magnet", url
+
+        else:
+            raise ValueError("无法解析 BitTorrent 来源")
+
+        if not torrentBytes:
+            raise ValueError("种子文件为空")
+
+        try:
+            ti = lt.torrent_info(torrentBytes)
+        except Exception as e:
+            raise ValueError(f"无效的 BitTorrent 种子文件：{e}") from e
+
+        torrentTrackers = [str(t.url).strip() for t in ti.trackers()]
+        allSources = (magnetTrackers, torrentTrackers, webTrackers) if sourceType == "magnet" else (torrentTrackers, webTrackers)
+        trackers = list(dict.fromkeys(t for g in allSources for t in g if t))
+
+        fileStorage = ti.files()
+        entries: list[BTFile] = [
+            BTFile(
+                index=i,
+                relativePath=fileStorage.file_path(i),
+                size=fileStorage.file_size(i),
+            )
+            for i in range(ti.num_files())
+            if not (fileStorage.file_flags(i) & lt.file_storage.flag_pad_file)
+        ]
+
+        if not entries:
+            raise ValueError("该种子中没有可下载的普通文件")
+
+        rootName = toSafeFilename(PurePosixPath(entries[0].relativePath).parts[0], fallback="torrent")
+        name = toSafeFilename(Path(entries[0].relativePath).name, fallback="torrent") if len(entries) == 1 else rootName
+
+        steps = [BTTaskStep(stepIndex=1)]
+        if sourceType == "magnet" and bittorrentConfig.saveMagnetFile.value:
+            steps.append(BTTorrentFileStep(stepIndex=0))
+        task = BTTask(
+            name=name,
+            url=sourceUrl,
+            fileSize=sum(e.size for e in entries),
+            outputFolder=outputFolder,
+            steps=steps,
+            sourceType=sourceType,
+            torrentData=b64encode(torrentBytes).decode(),
+            trackers=trackers,
+            files=entries,
+        )
+        return task
+
+
+class BitTorrentPack(FeaturePack):
+    packId = "bt"
+    config = bittorrentConfig
+    proxySchemes = PROXY_SCHEMES
+    parsers = [TorrentParser]
+
+    def taskCardClass(self, task: Task) -> type | None:
+        from .cards import BTTaskCard
+        return BTTaskCard
+
+    def draftCardClass(self, task: Task) -> type | None:
+        from .cards import BTDraftCard
+        return BTDraftCard
+
+    def optionCards(self, task, parent=None):
+        from app.view.components.option_cards import OutputFolderCard
+        return [OutputFolderCard(parent, initial=task.outputFolder)]
+
+    def detailCards(self, task, parent=None):
+        from .detail_cards import PeerCard, TorrentCard, TrackerCard
+        runner = self._services.coroutineRunner
+        return [TorrentCard(task, runner, parent), TrackerCard(task, runner, parent), PeerCard(task, runner, parent)]
+
+    def fileTypes(self):
+        return [
+            FileType(
+                extensions=(".torrent",),
+                displayName=N("BitTorrentPack", "BitTorrent 种子文件"),
+                mimeType="application/x-bittorrent",
+                icon="torrent",
+            ),
+        ]
+
+    def uriSchemes(self) -> list[UriScheme]:
+        return [UriScheme("magnet", "Magnet")]
+
+    async def activate(self):
+        btSession.open()
+        refreshTrackerListIfStale()
+
+    async def deactivate(self):
+        await btSession.close()

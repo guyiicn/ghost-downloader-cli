@@ -1,0 +1,16 @@
+from app.i18n import N
+
+N("TaskErrors", "服务器拒绝了请求（403），链接可能已失效（{detail}）")
+N("TaskErrors", "资源不存在（404），链接可能已失效（{detail}）")
+N("TaskErrors", "服务器返回了错误（{detail}）")
+N("TaskErrors", "获取到的内容不是有效的播放列表，链接可能已失效（{detail}）")
+N("TaskErrors", "缺少依赖程序（{detail}）")
+N("TaskErrors", "无法解析域名，请检查网络连接（{detail}）")
+N("TaskErrors", "连接被拒绝，请检查网络连接（{detail}）")
+N("TaskErrors", "连接超时，请检查网络连接（{detail}）")
+N("TaskErrors", "SSL 连接失败，请检查网络连接（{detail}）")
+N("TaskErrors", "当前平台暂不支持一键安装 N_m3u8DL-RE: {platform}")
+N("TaskErrors", "未找到适配 {target} 的 N_m3u8DL-RE 安装包")
+N("TaskErrors", "macOS 阻止了访问下载目录，请在 系统设置 > 隐私与安全性 > 完全磁盘访问权限 中添加 Ghost Downloader")
+N("TaskErrors", "无权限访问下载目录：{folder}")
+N("TaskErrors", "未找到输出文件：{detail}")

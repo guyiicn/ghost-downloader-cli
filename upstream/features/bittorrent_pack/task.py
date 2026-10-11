@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+import asyncio
+from base64 import b64decode, b64encode
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
+
+from app.models.task import Task, TaskError, TaskStep, TaskFile, TaskStatus
+from app.platform.filesystem import toPosixPath
+
+if TYPE_CHECKING:
+    from .session import TorrentParams, TorrentProgress
+
+
+@dataclass(kw_only=True)
+class BTFile(TaskFile):
+    priority: int = 4
+
+    def __post_init__(self):
+        self.relativePath = toPosixPath(self.relativePath)
+
+
+@dataclass(kw_only=True, eq=False)
+class BTTask(Task):
+    packId: str = "bt"
+    canEdit = True
+    canSeed = True
+    fileType = BTFile
+    sourceType: str = "torrent"
+    torrentData: str = ""
+    resumeData: str = ""
+    trackers: list[str] = field(default_factory=list)
+    shareRatioPercent: float = 0
+    seedingTimeSeconds: int = 0
+    stateText: str = ""
+    peerCount: int = 0
+    totalPeerCount: int = 0
+    seedCount: int = 0
+    downloadRate: int = 0
+    uploadRate: int = 0
+
+    def __post_init__(self):
+        if self.files:
+            self.files = [
+                item if isinstance(item, BTFile) else BTFile(**item)
+                for item in self.files
+            ]
+        self.selectionVersion = 0
+        super().__post_init__()
+        self.fileSize = sum(f.size for f in self.files if f.selected)
+
+    @property
+    def step(self) -> BTTaskStep:
+        return next(s for s in self.steps if isinstance(s, BTTaskStep))
+
+    def currentSnapshot(self) -> tuple[float, int, int]:
+        return self.step.progress, self.step.speed, self.step.receivedBytes
+
+    @property
+    def countSelected(self) -> int:
+        return sum(1 for f in self.files if f.selected)
+
+    def toRelativePath(self, file: BTFile) -> str:
+        if not self.isOutputFolder:
+            return self.name
+        return toPosixPath(Path(self.name, *PurePosixPath(file.relativePath).parts[1:]))
+
+    def priorities(self) -> list[int]:
+        return [f.priority if f.selected else 0 for f in self.files]
+
+    def setSelection(self, selectedIndexes: set[int]):
+        if not selectedIndexes:
+            raise ValueError("至少需要选择一个文件")
+        changed = False
+        for f in self.files:
+            selected = f.index in selectedIndexes
+            priority = 4 if selected else 0
+            if f.selected != selected or f.priority != priority:
+                changed = True
+            f.selected = selected
+            f.priority = priority
+            if not selected:
+                f.downloadedBytes = 0
+                f.completed = False
+        if not changed:
+            return
+        self.selectionVersion += 1
+        self.fileSize = sum(f.size for f in self.files if f.selected)
+
+        from .session import btSession
+        btSession.updatePriorities(self.taskId, self.priorities())
+
+        if self.step.status == TaskStatus.COMPLETED and any(f.selected and not f.completed for f in self.files):
+            self.step.status = TaskStatus.WAITING
+            self.step.progress = 0
+            self.step.receivedBytes = 0
+            self.step.speed = 0
+            self.step.error = None
+            self.updateStatus()
+
+    def reset(self) -> TaskStatus:
+        result = super().reset()
+        self.resumeData = ""
+        self.shareRatioPercent = 0
+        self.seedingTimeSeconds = 0
+        self.stateText = ""
+        self.peerCount = 0
+        self.totalPeerCount = 0
+        self.seedCount = 0
+        self.downloadRate = 0
+        self.uploadRate = 0
+        for f in self.files:
+            f.downloadedBytes = 0
+            f.completed = False
+        return result
+
+    def buildParams(self) -> TorrentParams:
+        from .session import TorrentParams
+        fileRenames = {}
+        for f in self.files:
+            mapped = self.toRelativePath(f)
+            if mapped != f.relativePath:
+                fileRenames[f.index] = mapped
+        return TorrentParams(
+            torrentData=b64decode(self.torrentData),
+            savePath=str(self.outputFolder),
+            resumeData=b64decode(self.resumeData) if self.resumeData else b"",
+            trackers=self.trackers.copy(),
+            filePriorities=self.priorities(),
+            fileRenames=fileRenames,
+            seedingTimeSeconds=self.seedingTimeSeconds,
+        )
+
+    def updateStats(self, p: TorrentProgress) -> None:
+        self.stateText = p.stateText
+        self.peerCount = p.peerCount
+        self.totalPeerCount = p.totalPeerCount
+        self.seedCount = p.seedCount
+        self.downloadRate = p.downloadRate
+        self.uploadRate = p.uploadRate
+        self.shareRatioPercent = p.shareRatioPercent
+        self.seedingTimeSeconds = p.seedingTimeSeconds
+
+    async def runSeeding(self, isManual: bool) -> None:
+        from loguru import logger
+        from .session import btSession
+        try:
+            resumeData = await btSession.runSeeding(
+                self.taskId, self.buildParams(), isManual, onProgress=self.updateStats)
+            self.resumeData = b64encode(resumeData).decode()
+            logger.info("{} 做种达到上限: 分享率 {:.2f}%, 做种时间 {}s",
+                        self.name, self.shareRatioPercent, self.seedingTimeSeconds)
+        finally:
+            cached = btSession.lastResumeData(self.taskId)
+            if cached:
+                self.resumeData = b64encode(cached).decode()
+            self.uploadRate = 0
+
+@dataclass(kw_only=True)
+class BTTaskStep(TaskStep):
+    async def run(self, reportSpeed, waitForSpeedLimit) -> None:
+        from .session import btSession, TorrentProgress
+
+        task: BTTask = self.task
+
+        if task.countSelected <= 0:
+            raise TaskError("至少需要选择一个文件")
+
+        def onProgress(p: TorrentProgress):
+            task.updateStats(p)
+            if p.totalWanted > 0:
+                task.fileSize = p.totalWanted
+
+            self.speed = p.downloadRate
+            reportSpeed(max(0, p.receivedBytes - self.receivedBytes))
+            self.receivedBytes = p.receivedBytes
+            self.progress = p.progress
+
+            for f in task.files:
+                if not f.selected:
+                    f.downloadedBytes = 0
+                    f.completed = False
+                    continue
+                dl = p.fileProgress[f.index] if f.index < len(p.fileProgress) else 0
+                f.downloadedBytes = dl
+                f.completed = f.size > 0 and dl >= f.size
+
+        selectionVersion = None
+        while selectionVersion != task.selectionVersion:
+            selectionVersion = task.selectionVersion
+            try:
+                resumeData = await btSession.run(task.taskId, task.buildParams(), onProgress=onProgress)
+                task.resumeData = b64encode(resumeData).decode()
+            except asyncio.CancelledError:
+                cached = btSession.lastResumeData(task.taskId)
+                if cached:
+                    task.resumeData = b64encode(cached).decode()
+                task.stateText = "paused_downloading"
+                raise
+            except Exception:
+                cached = btSession.lastResumeData(task.taskId)
+                if cached:
+                    task.resumeData = b64encode(cached).decode()
+                raise
+
+
+@dataclass(kw_only=True)
+class BTTorrentFileStep(TaskStep):
+    canPause = False
+
+    @property
+    def outputPath(self) -> str:
+        return str(self.task.outputFolder / f"{self.task.name}.torrent")
+
+    async def run(self, reportSpeed, waitForSpeedLimit) -> None:
+        Path(self.outputPath).write_bytes(b64decode(self.task.torrentData))

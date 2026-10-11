@@ -1,0 +1,586 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import struct
+import zipfile
+from dataclasses import dataclass, replace
+from enum import StrEnum
+from io import BytesIO
+from pathlib import Path
+from secrets import token_urlsafe
+from typing import Any, TYPE_CHECKING
+
+from loguru import logger
+
+from app.config.cfg import cfg
+from app.config.constants import LATEST_EXTENSION_VERSION, VERSION
+from app.platform.filesystem import isExisting
+from app.services.websocket_stream import WebSocketStream, readHead
+from app.signal import Signal
+from app.update import isNewer
+
+from app.models.task import MergeTaskOptions, PageTaskOptions
+
+if TYPE_CHECKING:
+    from app.models.task import Task, TaskOptions, ResourceTaskOptions
+
+@dataclass
+class BrowserClientSession:
+    stream: WebSocketStream
+    peerAddress: str
+    isAuthenticated: bool = False
+    isSubscribedToTasks: bool = False
+    lastSnapshot: str | None = None
+    extensionVersion: str = ""
+    installType: str = ""
+
+
+@dataclass(frozen=True)
+class PairRequest:
+    requestId: str
+    peerAddress: str
+    extensionVersion: str
+    clientKind: str
+
+
+class MessageType(StrEnum):
+    ERROR = "error"
+    HELLO = "hello"
+    HELLO_ACK = "hello_ack"
+    PAIR_REQUEST = "pair_request"
+    PAIR_RESULT = "pair_result"
+    SUBSCRIBE_TASKS = "subscribe_tasks"
+    TASK_SNAPSHOT = "task_snapshot"
+    CREATE_TASK = "create_task"
+    CREATE_TASK_RESULT = "create_task_result"
+    TASK_ACTION = "task_action"
+    TASK_ACTION_RESULT = "task_action_result"
+    RELOAD = "reload"
+
+
+class ErrorCode(StrEnum):
+    BAD_REQUEST = "bad_request"
+    PROTOCOL_MISMATCH = "protocol_mismatch"
+    UNAUTHORIZED = "unauthorized"
+
+
+class TaskAction(StrEnum):
+    TOGGLE_PAUSE = "toggle_pause"
+    CANCEL = "cancel"
+    REMOVE = "remove"
+    REDOWNLOAD = "redownload"
+    OPEN_FILE = "open_file"
+    OPEN_FOLDER = "open_folder"
+
+
+class TaskSource(StrEnum):
+    DOWNLOAD = "download"
+    RESOURCE = "resource"
+    RESOURCE_MERGE = "resource_merge"
+    PAGE_MEDIA = "page_media"
+
+
+class CreateTaskStatus(StrEnum):
+    CREATED = "created"
+    DRAFTED = "drafted"
+    REJECTED = "rejected"
+
+
+PROTOCOL_VERSION = 2
+
+
+def toStr(data: dict, key: str, default: str = "") -> str:
+    value = data.get(key)
+    return value if isinstance(value, str) else default
+
+
+def toInt(data: dict, key: str, default: int) -> int:
+    value = data.get(key)
+    return value if isinstance(value, int) and value > 0 else default
+
+
+def toResourceTaskOptions(resource: dict) -> ResourceTaskOptions:
+    from app.models.task import ResourceTaskOptions
+    hdrs = resource.get("headers") or {}
+    return ResourceTaskOptions(
+        url=toStr(resource, "url"),
+        name=toStr(resource, "filename"),
+        size=toInt(resource, "size", 0),
+        canUseRangeRequests=bool(resource.get("supportsRange")),
+        headers=hdrs,
+        sourceUserAgent=hdrs.get("user-agent", ""),
+    )
+
+
+def toTaskOptions(source: TaskSource, payload: dict) -> TaskOptions:
+    rawPath = payload.get("path")
+    outputFolder = Path(rawPath) if rawPath else Path(cfg.downloadFolder.value)
+
+    match source:
+        case TaskSource.RESOURCE_MERGE:
+            resources = payload.get("resources") or []
+            video = toResourceTaskOptions(resources[0]) if len(resources) > 0 else None
+            audio = toResourceTaskOptions(resources[1]) if len(resources) > 1 else None
+            return MergeTaskOptions(
+                url=video.url if video else "",
+                outputFolder=outputFolder,
+                video=video,
+                audio=audio,
+            )
+        case TaskSource.PAGE_MEDIA:
+            hdrs = payload.get("headers") or {}
+            return PageTaskOptions(
+                url=toStr(payload, "url"),
+                outputFolder=outputFolder,
+                pageUrl=toStr(payload, "pageUrl"),
+                pageTitle=toStr(payload, "pageTitle"),
+                headers=hdrs,
+                sourceUserAgent=hdrs.get("user-agent", ""),
+            )
+        case TaskSource.RESOURCE | TaskSource.DOWNLOAD:
+            return replace(
+                toResourceTaskOptions(payload),
+                outputFolder=outputFolder,
+                subworkerCount=toInt(payload, "preBlockNum", cfg.preBlockNum.value),
+            )
+        case _:
+            raise ValueError(f"unsupported task source: {source}")
+
+
+def toTaskSummary(task: Task) -> dict:
+    progress, speed, receivedBytes = task.currentSnapshot()
+    outputPath = Path(task.outputPath)
+    return {
+        "taskId": task.taskId,
+        "name": task.name,
+        "status": task.status.name.lower(),
+        "progress": round(progress, 2),
+        "receivedBytes": receivedBytes,
+        "fileSize": task.fileSize,
+        "speed": speed,
+        "createdAt": task.createdAt,
+        "canPause": task.canPause,
+        "canOpenFile": isExisting(outputPath),
+        "canOpenFolder": isExisting(outputPath.parent),
+        "fileExt": outputPath.suffix.lstrip(".").lower(),
+        "packName": task.packId,
+    }
+
+
+class BrowserService:
+    pairRequestChanged = Signal(object)
+    connectionChanged = Signal()
+    protocolMismatched = Signal()
+    taskDraftRequested = Signal(list)
+    extensionUpdated = Signal(str)
+
+    def __init__(self, coroutineRunner, taskService, speedChanged, parse, loadCrx, extensionFolder: Path):
+        self._coroutineRunner = coroutineRunner
+        self._taskService = taskService
+        self._parse = parse
+        self._loadCrx = loadCrx
+        self._extensionFolder = extensionFolder
+        self._sessions: dict[WebSocketStream, BrowserClientSession] = {}
+        self._pairRequest: PairRequest | None = None
+        self._pairSession: BrowserClientSession | None = None
+        self._isSnapshotPending = False
+        self._isUpdatingExtension = False
+        if not cfg.browserExtensionPairToken.value:
+            cfg.set(cfg.browserExtensionPairToken, token_urlsafe(16))
+        for signal in (taskService.taskAdded, taskService.taskRemoved, taskService.taskStarted,
+                       taskService.taskPaused, taskService.taskCompleted, taskService.taskFailed,
+                       taskService.seedingStarted, taskService.seedingStopped,
+                       taskService.queueChanged, taskService.fileDisappeared, speedChanged):
+            signal.connect(self._onTasksChanged)
+
+    async def install(self) -> Path:
+        def unpack() -> Path:
+            crx = self._loadCrx()
+            headerSize = struct.unpack_from("<I", crx, 8)[0]
+            self._extensionFolder.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(BytesIO(crx[12 + headerSize:])) as zf:
+                zf.extractall(self._extensionFolder)
+            return self._extensionFolder
+
+        return await asyncio.to_thread(unpack)
+
+    @property
+    def connectionSummary(self) -> tuple[str, str]:
+        for session in self._sessions.values():
+            if session.isAuthenticated:
+                return session.installType, session.extensionVersion
+        return "", ""
+
+    @property
+    def pairRequest(self) -> PairRequest | None:
+        return self._pairRequest
+
+    def regenerateToken(self) -> str:
+        token = token_urlsafe(16)
+        cfg.set(cfg.browserExtensionPairToken, token)
+        hadAuthenticated = any(s.isAuthenticated for s in self._sessions.values())
+        for session in self._sessions.values():
+            self._close(session)
+            session.isAuthenticated = False
+        if hadAuthenticated:
+            self.connectionChanged.emit()
+        return token
+
+    def approvePair(self, requestId: str) -> None:
+        session = self._takePairSession(requestId)
+        if session is None:
+            return
+        self._send(session, {
+            "type": MessageType.PAIR_RESULT,
+            "requestId": requestId,
+            "ok": True,
+            "token": cfg.browserExtensionPairToken.value,
+            "message": "配对成功",
+        })
+
+    def rejectPair(self, requestId: str) -> None:
+        session = self._takePairSession(requestId)
+        if session is None:
+            return
+        self._send(session, {
+            "type": MessageType.PAIR_RESULT,
+            "requestId": requestId,
+            "ok": False,
+            "message": "已拒绝配对请求",
+        })
+
+    def _takePairSession(self, requestId: str) -> BrowserClientSession | None:
+        if self._pairRequest is None or self._pairRequest.requestId != requestId:
+            return None
+        session = self._pairSession
+        self._setPairRequest(None, None)
+        return session
+
+    def _setPairRequest(self, request: PairRequest | None, session: BrowserClientSession | None) -> None:
+        self._pairRequest = request
+        self._pairSession = session
+        self.pairRequestChanged.emit(request)
+
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        head = await readHead(reader)
+        stream = await WebSocketStream.open(reader, writer, head, maxSize=2**20) if head else None
+        if stream is None:
+            return
+        host, port = writer.get_extra_info("peername")[:2]
+        self._coroutineRunner.post(self._onConnected, stream, f"{host}:{port}")
+        try:
+            async for message in stream.messages():
+                self._coroutineRunner.post(self._onMessageReceived, stream, message)
+        finally:
+            self._coroutineRunner.post(self._onDisconnected, stream)
+
+    def _send(self, session: BrowserClientSession, payload: dict) -> None:
+        self._coroutineRunner.submit(session.stream.send(json.dumps(payload, ensure_ascii=False)))
+
+    def _close(self, session: BrowserClientSession) -> None:
+        self._coroutineRunner.submit(session.stream.close())
+
+    def _sendError(self, session: BrowserClientSession, message: str, *,
+                   requestId: str | None = None, code: ErrorCode = ErrorCode.BAD_REQUEST) -> None:
+        payload: dict[str, Any] = {"type": MessageType.ERROR, "message": message, "code": code}
+        if requestId:
+            payload["requestId"] = requestId
+        self._send(session, payload)
+
+    def _sendResult(self, session: BrowserClientSession, messageType: MessageType,
+                    requestId: str, *, ok: bool, message: str = "", taskId: str = "") -> None:
+        payload: dict[str, Any] = {"type": messageType, "requestId": requestId, "ok": ok}
+        if message:
+            payload["message"] = message
+        if taskId:
+            payload["taskId"] = taskId
+        self._send(session, payload)
+
+    def _sendCreateTaskResult(self, session: BrowserClientSession, requestId: str,
+                              status: CreateTaskStatus, *,
+                              taskId: str = "", message: str = "") -> None:
+        payload: dict[str, Any] = {
+            "type": MessageType.CREATE_TASK_RESULT,
+            "requestId": requestId,
+            "status": status,
+        }
+        if taskId:
+            payload["taskId"] = taskId
+        if message:
+            payload["message"] = message
+        self._send(session, payload)
+
+    def _onConnected(self, stream: WebSocketStream, peerAddress: str) -> None:
+        self._sessions[stream] = BrowserClientSession(stream=stream, peerAddress=peerAddress)
+
+    def _onDisconnected(self, stream: WebSocketStream) -> None:
+        session = self._sessions.pop(stream)
+        if session is self._pairSession:
+            self._setPairRequest(None, None)
+        if session.isAuthenticated:
+            self.connectionChanged.emit()
+
+    def _onTasksChanged(self, *_args) -> None:
+        if self._isSnapshotPending:
+            return
+        self._isSnapshotPending = True
+        self._coroutineRunner.post(self._sendSnapshots)
+
+    def _sendSnapshots(self) -> None:
+        self._isSnapshotPending = False
+        subscribers = [s for s in self._sessions.values() if s.isAuthenticated and s.isSubscribedToTasks]
+        if not subscribers:
+            return
+        tasks = sorted(self._taskService.tasks, key=lambda t: t.createdAt, reverse=True)
+        snapshot = json.dumps({
+            "type": MessageType.TASK_SNAPSHOT,
+            "tasks": [toTaskSummary(t) for t in tasks],
+        }, ensure_ascii=False)
+
+        for session in subscribers:
+            if session.lastSnapshot == snapshot:
+                continue
+            session.lastSnapshot = snapshot
+            self._coroutineRunner.submit(session.stream.send(snapshot))
+
+    def _onMessageReceived(self, stream: WebSocketStream, message: bytes) -> None:
+        session = self._sessions.get(stream)
+        if session is None:
+            return
+
+        try:
+            data = json.loads(message)
+        except ValueError:
+            self._sendError(session, "无效的消息格式")
+            return
+
+        if not isinstance(data, dict):
+            self._sendError(session, "无效的消息结构")
+            return
+
+        rawType = toStr(data, "type")
+        try:
+            msgType = MessageType(rawType)
+        except ValueError:
+            self._sendError(session, "未知的消息类型")
+            return
+
+        if msgType == MessageType.PAIR_REQUEST:
+            self._onPairRequested(session, data)
+            return
+
+        if msgType == MessageType.HELLO:
+            self._onHello(session, data)
+            return
+
+        if not session.isAuthenticated:
+            self._sendError(session, "请先完成握手认证", code=ErrorCode.UNAUTHORIZED)
+            self._close(session)
+            return
+
+        if msgType == MessageType.SUBSCRIBE_TASKS:
+            session.isSubscribedToTasks = True
+            session.lastSnapshot = None
+            self._sendSnapshots()
+        elif msgType == MessageType.CREATE_TASK:
+            self._onCreateTask(session, data)
+        elif msgType == MessageType.TASK_ACTION:
+            self._onTaskAction(session, data)
+
+    def _onPairRequested(self, session: BrowserClientSession, data: dict) -> None:
+        requestId = toStr(data, "requestId")
+        if self._pairRequest is not None and session is not self._pairSession:
+            self._send(session, {
+                "type": MessageType.PAIR_RESULT,
+                "requestId": requestId,
+                "ok": False,
+                "message": "已有配对请求待处理",
+            })
+            return
+        self._setPairRequest(PairRequest(
+            requestId=requestId,
+            peerAddress=session.peerAddress,
+            extensionVersion=toStr(data, "extensionVersion"),
+            clientKind=toStr(data, "clientKind"),
+        ), session)
+
+    def _onHello(self, session: BrowserClientSession, data: dict) -> None:
+        requestId = toStr(data, "requestId") or None
+
+        if toInt(data, "protocolVersion", 0) != PROTOCOL_VERSION:
+            self._sendError(session, "协议版本不匹配", requestId=requestId, code=ErrorCode.PROTOCOL_MISMATCH)
+            self._close(session)
+            self.protocolMismatched.emit()
+            return
+
+        if toStr(data, "token") != cfg.browserExtensionPairToken.value:
+            self._sendError(session, "配对令牌无效", requestId=requestId, code=ErrorCode.UNAUTHORIZED)
+            self._close(session)
+            return
+
+        session.isAuthenticated = True
+        session.extensionVersion = toStr(data, "extensionVersion")
+        session.installType = toStr(data, "installType")
+        self.connectionChanged.emit()
+
+        self._send(session, {
+            "type": MessageType.HELLO_ACK,
+            "protocolVersion": PROTOCOL_VERSION,
+            "appVersion": VERSION,
+            "capabilities": {
+                "taskSnapshots": True,
+                "taskActions": [a.value for a in TaskAction],
+            },
+        })
+
+        if (session.installType == "development"
+                and isNewer(session.extensionVersion, LATEST_EXTENSION_VERSION)
+                and not self._isUpdatingExtension):
+            self._isUpdatingExtension = True
+            self._coroutineRunner.submit(
+                self.install(),
+                done=self._onExtensionExtracted,
+                failed=self._onExtensionExtractFailed,
+                session=session,
+            )
+
+    def _onExtensionExtracted(self, _path: Path, session: BrowserClientSession) -> None:
+        if session.stream not in self._sessions:
+            return
+        self._send(session, {"type": MessageType.RELOAD})
+        self.extensionUpdated.emit(LATEST_EXTENSION_VERSION)
+
+    def _onExtensionExtractFailed(self, error: str, **_) -> None:
+        self._isUpdatingExtension = False
+        logger.warning("Browser extension extract failed: {}", error)
+
+    def _onCreateTask(self, session: BrowserClientSession, data: dict) -> None:
+
+        requestId = toStr(data, "requestId")
+        payload = data.get("payload")
+        rawSource = toStr(data, "source", TaskSource.RESOURCE)
+        title = toStr(data, "title")
+        draft = data.get("draft")
+
+        if not requestId or not isinstance(payload, dict):
+            self._sendError(session, "无效的请求")
+            return
+
+        try:
+            source = TaskSource(rawSource)
+        except ValueError:
+            self._sendError(session, "未知的任务来源")
+            return
+
+        try:
+            options = toTaskOptions(source, payload)
+        except Exception as e:
+            self._sendCreateTaskResult(session, requestId, CreateTaskStatus.REJECTED, message=repr(e))
+            return
+
+        decryptionKeys = payload.get("decryptionKeys") or []
+
+        self._coroutineRunner.submit(
+            self._parse(options),
+            done=self._onTaskParsed,
+            failed=self._onTaskParseFailed,
+            session=session, requestId=requestId, title=title, draft=draft,
+            decryptionKeys=decryptionKeys,
+        )
+
+    def _onTaskParsed(self, task: Task, session: BrowserClientSession, requestId: str,
+                      title: str, draft: bool | None = None,
+                      decryptionKeys: list | None = None) -> None:
+        if decryptionKeys:
+            task.setOptions({"decryptionKeys": decryptionKeys})
+
+        if title:
+            existingSuffix = Path(task.name).suffix
+            if existingSuffix and not title.lower().endswith(existingSuffix.lower()):
+                task.setName(title + existingSuffix)
+            else:
+                task.setName(title)
+
+        shouldDraft = draft if draft is not None else cfg.shouldDraftTakenDownload.value
+        if shouldDraft:
+            self._sendCreateTaskResult(session, requestId, CreateTaskStatus.DRAFTED)
+            self.taskDraftRequested.emit([task])
+            return
+
+        if not self._taskService.add(task):
+            self._sendCreateTaskResult(session, requestId, CreateTaskStatus.DRAFTED)
+            return
+        self._sendCreateTaskResult(session, requestId, CreateTaskStatus.CREATED, taskId=task.taskId)
+
+    def _onTaskParseFailed(self, error, session: BrowserClientSession, requestId: str, **_) -> None:
+        self._sendCreateTaskResult(session, requestId, CreateTaskStatus.REJECTED, message=str(error))
+
+    def _onTaskAction(self, session: BrowserClientSession, data: dict) -> None:
+        from app.models.task import TaskStatus
+        from app.platform.desktop import openFile, revealInFolder
+
+        requestId = toStr(data, "requestId")
+        taskId = toStr(data, "taskId")
+        rawAction = toStr(data, "action")
+
+        if not requestId:
+            self._sendError(session, "缺少 requestId")
+            return
+
+        try:
+            action = TaskAction(rawAction)
+        except ValueError:
+            self._sendResult(session, MessageType.TASK_ACTION_RESULT, requestId, ok=False, message="不支持的操作")
+            return
+
+        task = self._taskService.taskById(taskId)
+        if task is None:
+            self._sendResult(session, MessageType.TASK_ACTION_RESULT, requestId, ok=False, message="任务不存在")
+            return
+
+        try:
+            if action == TaskAction.TOGGLE_PAUSE:
+                if task.status == TaskStatus.RUNNING:
+                    if not task.canPause:
+                        self._sendResult(session, MessageType.TASK_ACTION_RESULT, requestId,
+                                         ok=False, message="当前任务不支持暂停")
+                        return
+                    self._taskService.pause(task)
+                elif task.status == TaskStatus.COMPLETED:
+                    self._sendResult(session, MessageType.TASK_ACTION_RESULT, requestId,
+                                     ok=False, message="任务已完成")
+                    return
+                else:
+                    self._taskService.start(task)
+
+            elif action == TaskAction.CANCEL:
+                self._taskService.delete(task, shouldDeleteFiles=True)
+
+            elif action == TaskAction.REMOVE:
+                self._taskService.delete(task, shouldDeleteFiles=False)
+
+            elif action == TaskAction.REDOWNLOAD:
+                self._taskService.redownload(task)
+
+            elif action == TaskAction.OPEN_FILE:
+                path = Path(task.outputPath)
+                if not isExisting(path):
+                    self._sendResult(session, MessageType.TASK_ACTION_RESULT, requestId,
+                                     ok=False, message="文件尚未生成")
+                    return
+                openFile(path)
+
+            elif action == TaskAction.OPEN_FOLDER:
+                path = Path(task.outputPath)
+                if not isExisting(path.parent):
+                    self._sendResult(session, MessageType.TASK_ACTION_RESULT, requestId,
+                                     ok=False, message="目录不存在")
+                    return
+                revealInFolder(path)
+
+            self._sendResult(session, MessageType.TASK_ACTION_RESULT, requestId, ok=True)
+
+        except Exception as e:
+            logger.opt(exception=e).error("Browser task action failed")
+            self._sendResult(session, MessageType.TASK_ACTION_RESULT, requestId, ok=False, message=repr(e))

@@ -1,0 +1,206 @@
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+LANGUAGES = ["zh_CN", "en_US", "ja_JP", "zh_TW", "zh_HK", "ru_RU", "pt_BR", "es_ES"]
+LANGUAGE_FAMILY_FALLBACKS = {
+    "zh": "zh_CN",
+    "yue": "zh_HK",
+    "en": "en_US",
+    "ja": "ja_JP",
+    "ru": "ru_RU",
+    "pt": "pt_BR",
+    "es": "es_ES",
+}
+ASSETS_DIR = REPO / "app" / "assets"
+I18N_DIR = ASSETS_DIR / "i18n"
+QRC_PATH = ASSETS_DIR / "resources.qrc"
+RESOURCES_RCC = ASSETS_DIR / "resources.rcc"
+
+ENGINE_CONTEXTS = ["TaskErrors", "BinaryRuntime", "TaskState",
+                   "TrackBar", "YtDlpDraftCard", "StreamSelectCard"]
+
+ANDROID_RES_DIR = REPO / "android" / "app" / "src" / "main" / "res"
+ANDROID_I18N_KT = (
+    REPO / "android" / "app" / "src" / "main" / "java" / "com" / "xychr"
+    / "ghostdownloader" / "i18n" / "EngineStrings.kt"
+)
+ANDROID_STRINGS_FILE = "strings_engine.xml"
+ANDROID_LOCALE_FOLDERS = {
+    "zh_CN": "values",
+    "en_US": "values-en",
+    "zh_TW": "values-zh-rTW",
+    "zh_HK": "values-zh-rHK",
+    "ja_JP": "values-ja",
+    "ru_RU": "values-ru",
+    "pt_BR": "values-pt-rBR",
+    "es_ES": "values-es",
+}
+
+
+def findTool(name: str) -> str:
+    path = shutil.which(name)
+    if path:
+        return path
+    candidate = Path(sys.executable).resolve().with_name(
+        f"{name}{'.exe' if os.name == 'nt' else ''}")
+    if candidate.exists():
+        return str(candidate)
+    raise FileNotFoundError(f"Required tool not found in PATH: {name}")
+
+
+def findSources() -> list[str]:
+    sources = []
+    for root in ("app", "features"):
+        for path in sorted((REPO / root).rglob("*.py")):
+            if path == RESOURCES_RCC:
+                continue
+            sources.append(path.relative_to(REPO).as_posix())
+    return sources
+
+
+def updateTsFiles(sources: list[str]) -> None:
+    lupdate = findTool("pyside6-lupdate")
+    for locale in LANGUAGES:
+        subprocess.run([
+            lupdate, 
+            "-tr-function-alias", "QT_TRANSLATE_NOOP+=N",
+            "-no-ui-lines",
+            "-source-language", "zh_CN",
+            "-target-language", locale,
+            *sources,
+            "-ts", (I18N_DIR / f"gd3.{locale}.ts").as_posix(),
+        ], cwd=REPO, check=True)
+
+
+def buildQmFiles() -> None:
+    lrelease = findTool("pyside6-lrelease")
+    for locale in LANGUAGES:
+        ts = I18N_DIR / f"gd3.{locale}.ts"
+        qm = I18N_DIR / f"gd3.{locale}.qm"
+        subprocess.run([lrelease, ts.as_posix(), "-qm", qm.as_posix()],
+                       cwd=REPO, check=True)
+
+
+def updateQrcI18n() -> None:
+    text = QRC_PATH.read_text(encoding="utf-8")
+    text = re.sub(
+        r'\s*<qresource prefix="i18n">.*?</qresource>',
+        '', text, flags=re.DOTALL,
+    )
+    lines = []
+    for locale in LANGUAGES:
+        lines.append(f'    <file alias="gd3.{locale}.qm">i18n/gd3.{locale}.qm</file>')
+    for lang, fallback in LANGUAGE_FAMILY_FALLBACKS.items():
+        lines.append(f'    <file alias="gd3.{lang}.qm">i18n/gd3.{fallback}.qm</file>')
+    entries = "\n".join(lines)
+    section = f'\n  <qresource prefix="i18n">\n{entries}\n  </qresource>'
+    text = text.replace("</RCC>", f"{section}\n</RCC>")
+    QRC_PATH.write_text(text, encoding="utf-8")
+
+
+def readCatalog(locale: str) -> dict[str, tuple[str, str]]:
+    root = ET.parse(I18N_DIR / f"gd3.{locale}.ts").getroot()
+    entries: dict[str, tuple[str, str]] = {}
+    for context in root.findall("context"):
+        ctxName = context.findtext("name")
+        if ctxName not in ENGINE_CONTEXTS:
+            continue
+        for message in context.findall("message"):
+            source = message.findtext("source") or ""
+            node = message.find("translation")
+            if locale == "zh_CN":
+                text = source
+            elif node is None or node.get("type"):
+                # 只收 finished（无 type 属性）。vanished / obsolete 是源文案已删除，
+                # 留着会变成默认语言没有的孤儿 string，lint 的 ExtraTranslation 报错
+                continue
+            else:
+                text = (node.text or "").strip()
+            if source and text:
+                digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:8]
+                resName = f"engine_{ctxName.lower()}_{digest}"
+                entries[resName] = (source, text)
+    return entries
+
+
+
+def escapeAndroidString(text: str) -> str:
+    for old, new in (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"),
+                     ("'", "\\'"), ('"', '\\"')):
+        text = text.replace(old, new)
+    return text
+
+
+def buildAndroidStrings() -> None:
+    source = readCatalog("zh_CN")
+    if not source:
+        raise SystemExit(f"No messages found for contexts {ENGINE_CONTEXTS}")
+
+    nameToSource = {}
+    for name, (text, _) in source.items():
+        if name in nameToSource:
+            raise SystemExit(f"resourceName collision: {text!r} vs {nameToSource[name]!r}")
+        nameToSource[name] = text
+
+    for locale, folder in ANDROID_LOCALE_FOLDERS.items():
+        entries = readCatalog(locale)
+        if not entries:
+            continue
+        target = ANDROID_RES_DIR / folder
+        target.mkdir(parents=True, exist_ok=True)
+        xmlLines = ["<!-- Generated by scripts/sync_i18n_res.py -->", "<resources>"]
+        for resource in sorted(entries):
+            text = escapeAndroidString(entries[resource][1])
+            xmlLines.append(
+                f'    <string name="{resource}" formatted="false">{text}</string>'
+            )
+        xmlLines.append("</resources>")
+        (target / ANDROID_STRINGS_FILE).write_text("\n".join(xmlLines) + "\n", encoding="utf-8")
+
+    ANDROID_I18N_KT.parent.mkdir(parents=True, exist_ok=True)
+    ktLines = [
+        "// Generated by scripts/sync_i18n_res.py",
+        "package com.xychr.ghostdownloader.i18n",
+        "",
+        "import com.xychr.ghostdownloader.R",
+        "",
+        "internal val engineStrings: Map<String, Int> = mapOf(",
+    ]
+    for resource in sorted(source):
+        text = source[resource][0].replace("\\", "\\\\").replace('"', '\\"')
+        ktLines.append(f'    "{text}" to R.string.{resource},')
+    ktLines.append(")")
+    ANDROID_I18N_KT.write_text("\n".join(ktLines) + "\n", encoding="utf-8")
+
+
+
+def buildResources() -> None:
+    rcc = findTool("pyside6-rcc")
+    subprocess.run([
+        rcc, "--binary",
+        "-o", RESOURCES_RCC.as_posix(),
+        QRC_PATH.as_posix(),
+    ], cwd=REPO, check=True)
+
+
+def main() -> int:
+    I18N_DIR.mkdir(parents=True, exist_ok=True)
+
+    sources = findSources()
+    updateTsFiles(sources)
+    buildQmFiles()
+    updateQrcI18n()
+    buildAndroidStrings()
+    buildResources()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
