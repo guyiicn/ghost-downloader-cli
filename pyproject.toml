@@ -19,7 +19,8 @@ dependencies = [
     "winloop>=0.6.0; sys_platform == 'win32'",
     # GUI stack: qfluentwidgets pulls PySide6, but headless only imports its
     # config classes (no QApplication). Cheaper than vendoring a fake Qt.
-    "qfluentwidgets>=1.11.2",
+    # NOTE: pip name is PySide6-Fluent-Widgets; import name is qfluentwidgets.
+    "PySide6-Fluent-Widgets>=1.11.2",
 ]
 
 [project.scripts]
