@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # full history so the subtree stays resolvable
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: Smoke test — CLI help
+        run: gd-cli --help
+
+      - name: Smoke test — one-shot download of a real small file
+        run: |
+          gd-cli download https://raw.githubusercontent.com/XiaoYouChR/Ghost-Downloader-3/main/README_zh.md \
+            -o "$RUNNER_TEMP/gd-test" --progress --timeout 5
+          test -s "$RUNNER_TEMP/gd-test/README_zh.md"
+
+      - name: Smoke test — daemon RPC roundtrip
+        run: |
+          gd-cli daemon -o "$RUNNER_TEMP/gd-test" &
+          DAEMON_PID=$!
+          sleep 5
+          GID=$(curl -s http://127.0.0.1:16800/jsonrpc \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":"1","method":"aria2.addUri","params":[["https://raw.githubusercontent.com/XiaoYouChR/Ghost-Downloader-3/main/LICENSE"],{"dir":"'"$RUNNER_TEMP"'/gd-test"}]}' \
+            | python3 -c "import sys,json;print(json.load(sys.stdin)['result'])")
+          echo "gid=$GID"
+          sleep 8
+          curl -s http://127.0.0.1:16800/jsonrpc \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":"2","method":"aria2.tellStatus","params":["'"$GID"'"]}' | grep -q '"status"'
+          test -s "$RUNNER_TEMP/gd-test/LICENSE"
+          kill $DAEMON_PID
