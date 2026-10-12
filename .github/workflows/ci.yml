@@ -53,5 +53,11 @@ jobs:
           curl -s http://127.0.0.1:16800/jsonrpc \
             -H 'Content-Type: application/json' \
             -d '{"jsonrpc":"2.0","id":"2","method":"aria2.tellStatus","params":["'"$GID"'"]}' | grep -q '"status"'
-          test -s "$RUNNER_TEMP/gd-test/LICENSE"
+          # engine appends extension from MIME type when URL has none (LICENSE → LICENSE.txt)
+          for i in $(seq 1 30); do
+            f=$(ls "$RUNNER_TEMP"/gd-test/LICENSE* 2>/dev/null | head -1)
+            [ -n "$f" ] && [ -s "$f" ] && break
+            sleep 1
+          done
+          test -s "$f"
           kill $DAEMON_PID
