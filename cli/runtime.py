@@ -20,7 +20,7 @@ def resolveFeaturesDir() -> Path:
     """
     try:  # installed mode
         import features as _features  # noqa: PLC0415
-        return Path(_features.__file__).resolve().parent
+        return Path(list(_features.__path__)[0])
     except ImportError:
         pass
 
