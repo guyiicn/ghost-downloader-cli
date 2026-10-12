@@ -232,7 +232,7 @@ def patch_aria2_rpc() -> None:
             "totalLength": str(task.fileSize),
             "completedLength": str(received),
             "downloadSpeed": str(speed),
-            "files": [{"path": str(f.path), "completedLength": str(f.receivedBytes), "selected": f.selected} for f in (task.files or [])],
+            "files": [{"path": str(f.relativePath), "completedLength": str(f.downloadedBytes), "selected": f.selected} for f in (task.files or [])],
         }
 
     async def _shutdown(self, params: list) -> str:
