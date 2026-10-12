@@ -17,8 +17,7 @@ dependencies = [
     "wreq==0.12.3",  # 0.13 breaks the engine — pinned until upstream bumps
     "uvloop>=0.22.1; sys_platform != 'win32'",
     "winloop>=0.6.0; sys_platform == 'win32'",
-    # GUI stack: qfluentwidgets pulls PySide6, but headless only imports its
-    # config classes (no QApplication). Cheaper than vendoring a fake Qt.
+    # Headless only imports qfluentwidgets' config classes (no QApplication).
     # NOTE: pip name is PySide6-Fluent-Widgets; import name is qfluentwidgets.
     "PySide6-Fluent-Widgets>=1.11.2",
 ]
@@ -29,6 +28,3 @@ gd-cli = "cli.main:main"
 [build-system]
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
-
-[tool.setuptools]
-packages = ["cli"]
